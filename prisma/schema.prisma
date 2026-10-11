@@ -316,6 +316,15 @@ model User {
   // wallet auth and never link a number. Used as the WhatsApp delivery
   // destination for alert rules (#289); alerts on the WHATSAPP/BOTH channel are
   // skipped (logged, not errored) for users without a number on file.
+  phone             String?          @unique
+  riskTolerance     Int              @default(5)
+  rebalanceStrategy String? // 'MAX_YIELD' | 'TARGET_ALLOCATION' | null (defaults to MAX_YIELD)
+  strategyConfig    Json? // e.g. { "targetAllocations": { "Blend": 50, "Stellar DEX": 30, "Luma": 20 } }
+  liquidityFloor    Decimal?         @db.Decimal(36, 18)
+  taxAwareRebalancing Boolean         @default(false) // #550 - opt-in wash-sale-aware rebalancing
+  isActive          Boolean          @default(true)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
   phone               String?          @unique
   riskTolerance       Int              @default(5)
   rebalanceStrategy   String? // 'MAX_YIELD' | 'TARGET_ALLOCATION' | null (defaults to MAX_YIELD)
@@ -609,6 +618,7 @@ model Position {
   depositedAmount Decimal        @db.Decimal(36, 18)
   currentValue    Decimal        @db.Decimal(36, 18)
   yieldEarned     Decimal        @default(0) @db.Decimal(36, 18)
+  liquidityLocked Boolean        @default(false)
   status          PositionStatus @default(ACTIVE)
   openedAt        DateTime       @default(now())
   closedAt        DateTime?
@@ -2417,6 +2427,23 @@ model TreasurySweepPolicy {
   @@map("treasury_sweep_policies")
 }
 
+// --- Issue #350: Liquidity Risk & Time-to-Exit Estimation ---
+model ProtocolLiquiditySnapshot {
+  id                   String   @id @default(uuid())
+  protocolName         String
+  assetSymbol          String
+  poolTvl              Decimal  @db.Decimal(36, 18)
+  availableLiquidity   Decimal  @db.Decimal(36, 18)
+  dailyVolume          Decimal  @db.Decimal(36, 18)
+  withdrawalQueueDepth Int?
+  withdrawalDelayHours Int?
+  depthCurve           Json // [{ sizeUsd, priceImpactBps }]
+  fetchedAt            DateTime @default(now())
+
+  @@unique([protocolName, assetSymbol, fetchedAt])
+  @@index([protocolName, assetSymbol])
+  @@index([fetchedAt])
+  @@map("protocol_liquidity_snapshots")
 // ─────────────────────────────────────────────────────────────────────────────
 // Treasury accounts (#jobs/treasurySweep.ts, #outbox/executors.ts)
 // ─────────────────────────────────────────────────────────────────────────────
