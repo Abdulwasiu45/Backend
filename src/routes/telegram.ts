@@ -5,12 +5,11 @@ import { logger } from '../utils/logger'
 
 const router = express.Router()
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || ''
-const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || ''
-
 function verifyTelegramRequest(req: Request): boolean {
   const header = req.header('x-telegram-bot-api-secret-token')
-  return Boolean(BOT_TOKEN && WEBHOOK_SECRET && header === WEBHOOK_SECRET)
+  const botToken = process.env.TELEGRAM_BOT_TOKEN || ''
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET || ''
+  return Boolean(botToken && webhookSecret && header === webhookSecret)
 }
 
 router.get('/health', (_req: Request, res: Response) => {
@@ -46,7 +45,6 @@ router.post('/', async (req: Request, res: Response) => {
       })
       return res.status(502).send('Bad Gateway')
     }
-
     return res.status(200).send('OK')
   } catch (error) {
     logger.error('[Telegram webhook] error handling message:', error)

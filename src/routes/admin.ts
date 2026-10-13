@@ -13,11 +13,19 @@ import { Router, Request, Response } from 'express'
 import { getEventMetrics } from '../stellar/events'
 import { DeadLetterQueue } from '../stellar/dlq'
 import { logger } from '../utils/logger'
-import { requireAdminAuth, requireAdminScope } from '../middleware/adminAuth'
+import {
+  requireAdminAuth,
+  requireAdminScope,
+  getAdminAuth,
+  hasAdminScope,
+  validateScopesInput,
+} from '../middleware/adminAuth'
 import { getAllProviderHealth, adminSetProviderCircuit } from '../fiat/registry'
 import db from '../db'
+import { revokeSession } from '../services/refresh-token.service'
 import { alertingService } from '../services/alerting'
 import { verifyAuditChain } from '../audit/chain'
+import { getJobDashboardSnapshot } from '../utils/job-metrics'
 import {
   listBreakers,
   manualTripBreaker,
@@ -35,12 +43,14 @@ function auditLog(
   result: string,
   details?: Record<string, any>
 ): void {
-  const adminAuth = res.locals.adminAuth
+  const adminAuth = getAdminAuth(res)
+  if (!adminAuth) {
+    logger.error('[Admin Audit] Missing valid admin identity', { action })
+    return
+  }
   const auditPayload = {
-    adminIdentity: adminAuth
-      ? `${adminAuth.name} (${adminAuth.role})`
-      : 'unknown',
-    adminId: adminAuth?.id ?? null,
+    adminIdentity: `${adminAuth.name} (${adminAuth.role})`,
+    adminId: adminAuth.id,
     action,
     target: req.originalUrl || req.path,
     result,
@@ -86,6 +96,12 @@ router.get(
   '/audit/verify',
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const blocks = await prisma.auditBlock.findMany({
         orderBy: { height: 'asc' },
@@ -147,9 +163,45 @@ router.get(
 )
 
 router.get(
+  '/jobs/dashboard',
+  requireAdminScope('metrics:read'),
+  async (req: Request, res: Response) => {
+    try {
+      const jobSnapshot = await getJobDashboardSnapshot()
+      const dlqSize = await DeadLetterQueue.getSize()
+      const dlqBreakdown = await DeadLetterQueue.getStatusBreakdown()
+
+      res.status(200).json({
+        timestamp: jobSnapshot.timestamp,
+        jobs: jobSnapshot.jobs,
+        dlq: {
+          size: dlqSize,
+          statusBreakdown: dlqBreakdown,
+          triageRunbook: '/docs/JOB_TRIAGE_RUNBOOK.md',
+        },
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      logger.error('[Admin] Failed to generate job dashboard:', {
+        error: message,
+      })
+      res
+        .status(500)
+        .json({ error: 'Failed to generate job dashboard', message })
+    }
+  }
+)
+
+router.get(
   '/audit/prove',
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const from = Number(req.query.from ?? 0)
       const to = Number(req.query.to ?? Number.MAX_SAFE_INTEGER)
@@ -202,6 +254,12 @@ router.get(
   '/stellar/metrics',
   requireAdminScope('metrics:read'),
   (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const metrics = getEventMetrics()
       auditLog(req, res, 'GET_STELLAR_METRICS', 'success')
@@ -253,6 +311,12 @@ router.get(
   '/dlq/inspect',
   requireAdminScope('dlq:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const {
         status,
@@ -376,6 +440,12 @@ router.post(
   '/dlq/retry',
   requireAdminScope('dlq:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { dryRun = false } = req.body
 
@@ -453,6 +523,12 @@ router.post(
   '/dlq/resolve',
   requireAdminScope('dlq:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { eventId } = req.body
 
@@ -514,6 +590,12 @@ router.post(
   '/dlq/replay',
   requireAdminScope('dlq:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { eventIds, dryRun = false } = req.body
 
@@ -644,6 +726,12 @@ router.post(
   '/stellar/backfill',
   requireAdminScope('backfill:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { startLedger, endLedger } = req.body
 
@@ -719,6 +807,12 @@ router.post(
   '/keys',
   requireAdminScope('keys:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { name, role, scopes, expiresAt } = req.body
 
@@ -732,10 +826,21 @@ router.post(
           .status(400)
           .json({ success: false, error: 'role is required' })
       }
-      if (!Array.isArray(scopes) || scopes.length === 0) {
-        return res
-          .status(400)
-          .json({ success: false, error: 'scopes must be a non-empty array' })
+      if (!validateScopesInput(scopes)) {
+        return res.status(400).json({
+          success: false,
+          error: 'scopes must be a non-empty array of valid admin scopes',
+        })
+      }
+
+      if (!scopes.every((scope) => hasAdminScope(adminAuth, scope))) {
+        auditLog(req, res, 'CREATE_ADMIN_KEY', 'denied', {
+          requestedScopes: scopes,
+        })
+        return res.status(403).json({
+          success: false,
+          error: 'Cannot grant admin scopes beyond your own privileges',
+        })
       }
 
       const crypto = await import('node:crypto')
@@ -813,6 +918,12 @@ router.delete(
   '/keys/:id',
   requireAdminScope('keys:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { id } = req.params
 
@@ -867,6 +978,113 @@ router.delete(
 )
 
 /**
+ * POST /api/admin/keys/:id/rotate
+ * Rotate an admin API key - revokes old key and creates new one with same scopes.
+ * Required scope: keys:write (#491)
+ */
+router.post(
+  '/keys/:id/rotate',
+  requireAdminScope('keys:write'),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params
+
+      const existing = await prisma.adminApiKey.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          name: true,
+          role: true,
+          scopes: true,
+          revokedAt: true,
+          expiresAt: true,
+        },
+      })
+
+      if (!existing) {
+        return res
+          .status(404)
+          .json({ success: false, error: 'Admin key not found' })
+      }
+
+      if (existing.revokedAt) {
+        return res
+          .status(409)
+          .json({ success: false, error: 'Cannot rotate a revoked key' })
+      }
+
+      const crypto = await import('node:crypto')
+      const bcrypt = await import('bcryptjs')
+
+      // Generate new token
+      const rawToken = crypto.randomBytes(32).toString('hex')
+      const hash = await bcrypt.hash(rawToken, 12)
+      const tokenPrefix =
+        'sha256:' + crypto.createHash('sha256').update(rawToken).digest('hex')
+
+      // Create new key with same properties
+      const newKey = await prisma.adminApiKey.create({
+        data: {
+          name: `${existing.name} (rotated)`,
+          role: existing.role,
+          scopes: existing.scopes,
+          hash,
+          tokenPrefix,
+          expiresAt: existing.expiresAt,
+        },
+        select: {
+          id: true,
+          name: true,
+          role: true,
+          scopes: true,
+          expiresAt: true,
+          createdAt: true,
+        },
+      })
+
+      // Revoke old key
+      await prisma.adminApiKey.update({
+        where: { id },
+        data: { revokedAt: new Date() },
+      })
+
+      logger.info('[Admin] Admin key rotated', {
+        oldKeyId: id,
+        newKeyId: newKey.id,
+      })
+
+      auditLog(req, res, 'ROTATE_ADMIN_KEY', 'success', {
+        oldKeyId: id,
+        newKeyId: newKey.id,
+      })
+
+      res.status(201).json({
+        success: true,
+        data: {
+          ...newKey,
+          token: rawToken,
+          warning: 'Store this token securely. It will not be shown again.',
+          oldKeyId: id,
+          oldKeyStatus: 'revoked',
+        },
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to rotate admin key', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      auditLog(req, res, 'ROTATE_ADMIN_KEY', 'failure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error: 'Failed to rotate admin key',
+      })
+    }
+  }
+)
+
+/**
  * GET /api/admin/keys
  * List all admin API keys (metadata only — no hashes).
  * Required scope: keys:read
@@ -875,6 +1093,12 @@ router.get(
   '/keys',
   requireAdminScope('keys:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const keys = await prisma.adminApiKey.findMany({
         select: {
@@ -917,6 +1141,12 @@ router.get(
   '/wallets/rotation-status',
   requireAdminScope('keys:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const totalWallets = await prisma.custodialWallet.count()
       const v1Wallets = await prisma.custodialWallet.count({
@@ -970,6 +1200,12 @@ router.get(
   '/fiat/providers',
   requireAdminScope('fiat:read'),
   (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const providers = getAllProviderHealth()
       auditLog(req, res, 'GET_FIAT_PROVIDER_HEALTH', 'success')
@@ -1000,6 +1236,12 @@ router.post(
   '/fiat/providers/:name/failover',
   requireAdminScope('fiat:write'),
   (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     const { name } = req.params
     const { state } = req.body ?? {}
 
@@ -1041,6 +1283,12 @@ router.get(
   '/outbox',
   requireAdminScope('outbox:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { status, kind, priority, userId, limit, offset } = req.query
       const { listOps } = await import('../outbox/service')
@@ -1085,6 +1333,12 @@ router.get(
   '/outbox/stats',
   requireAdminScope('outbox:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { getQueueStats } = await import('../outbox/service')
       const stats = await getQueueStats()
@@ -1112,6 +1366,12 @@ router.get(
   '/outbox/:id',
   requireAdminScope('outbox:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { getOp } = await import('../outbox/service')
       const op = await getOp(req.params.id)
@@ -1143,6 +1403,12 @@ router.post(
   '/outbox/:id/retry',
   requireAdminScope('outbox:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { forceRetry } = await import('../outbox/service')
       const op = await forceRetry(req.params.id)
@@ -1167,6 +1433,12 @@ router.post(
   '/outbox/:id/cancel',
   requireAdminScope('outbox:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { cancelOp } = await import('../outbox/service')
       const op = await cancelOp(req.params.id)
@@ -1193,10 +1465,15 @@ router.post(
   '/approvals/:id/cancel',
   requireAdminScope('approvals:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { cancel } = await import('../approvals/service')
-      const adminAuth = res.locals.adminAuth
-      const result = await cancel(req.params.id, adminAuth?.id ?? 'admin', {
+      const result = await cancel(req.params.id, adminAuth.id, {
         isAdmin: true,
       })
       auditLog(req, res, 'APPROVAL_ADMIN_CANCEL', 'success', {
@@ -1227,6 +1504,12 @@ router.get(
   '/referrals/flagged',
   requireAdminScope('referrals:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { listFlaggedConversions } = await import('../referral/service')
       const flagged = await listFlaggedConversions()
@@ -1255,6 +1538,12 @@ router.post(
   '/referrals/:id/review',
   requireAdminScope('referrals:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     const { decision } = req.body ?? {}
     if (decision !== 'approve' && decision !== 'reject') {
       return res.status(400).json({
@@ -1265,12 +1554,7 @@ router.post(
 
     try {
       const { resolveFlaggedConversion } = await import('../referral/service')
-      const adminAuth = res.locals.adminAuth
-      await resolveFlaggedConversion(
-        req.params.id,
-        decision,
-        adminAuth?.id ?? 'admin'
-      )
+      await resolveFlaggedConversion(req.params.id, decision, adminAuth.id)
       auditLog(req, res, 'REFERRAL_REVIEW', 'success', {
         conversionId: req.params.id,
         decision,
@@ -1307,6 +1591,12 @@ router.post(
   '/erasure',
   requireAdminScope('erasure:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { userId, dryRun = false } = req.body as {
         userId: string
@@ -1383,8 +1673,14 @@ router.post(
  */
 router.get(
   '/users/:id/sessions',
-  requireAdminScope('read'),
+  requireAdminScope('sessions:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const sessions = await prisma.session.findMany({
         where: { userId: req.params.id },
@@ -1422,23 +1718,43 @@ router.get(
  */
 router.post(
   '/users/:id/sessions/revoke-all',
-  requireAdminScope('write'),
+  requireAdminScope('sessions:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
-      const result = await prisma.session.updateMany({
+      // #472: an admin kill-switch that only sets revokedAt leaves every
+      // outstanding refresh token live, so the user (or whoever captured one)
+      // can mint new access tokens after the admin has revoked them. revokeSession()
+      // clears the refresh material as part of the revoke.
+      const sessions = await prisma.session.findMany({
         where: { userId: req.params.id, revokedAt: null },
-        data: { revokedAt: new Date(), revokedReason: 'admin' },
+        select: { id: true, deviceType: true, approxLocation: true },
       })
+
+      await Promise.all(
+        sessions.map((session) =>
+          revokeSession(session.id, 'admin', {
+            userId: req.params.id,
+            deviceType: session.deviceType,
+            approxLocation: session.approxLocation,
+          })
+        )
+      )
 
       auditLog(req, res, 'REVOKE_ALL_USER_SESSIONS', 'success', {
         userId: req.params.id,
-        count: result.count,
+        count: sessions.length,
         reason: req.body?.reason ?? 'admin_action',
       })
 
       res.status(200).json({
         success: true,
-        data: { revokedCount: result.count },
+        data: { revokedCount: sessions.length },
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error'
@@ -1458,8 +1774,14 @@ router.post(
  */
 router.get(
   '/agent/decisions',
-  requireAdminScope('read'),
+  requireAdminScope('agent:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const outcome = req.query.outcome as string | undefined
       const fromProtocol = req.query.fromProtocol as string | undefined
@@ -1578,8 +1900,14 @@ router.get(
  */
 router.get(
   '/reserves',
-  requireAdminScope('read'),
+  requireAdminScope('reserves:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const rows: any[] = await prisma.reserveSponsorship.findMany({
         where: { status: 'ACTIVE' },
@@ -1661,8 +1989,14 @@ router.get(
  */
 router.get(
   '/agent/breakers',
-  requireAdminScope('agent'),
+  requireAdminScope('agent:read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const breakers = await listBreakers()
       auditLog(req, res, 'LIST_AGENT_BREAKERS', 'success', {
@@ -1684,8 +2018,14 @@ router.get(
  */
 router.post(
   '/agent/breakers',
-  requireAdminScope('agent'),
+  requireAdminScope('agent:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { scope, scopeKey, reason } = req.body ?? {}
 
@@ -1721,9 +2061,7 @@ router.post(
         return
       }
 
-      const adminIdentity = res.locals.adminAuth
-        ? `${res.locals.adminAuth.name} (${res.locals.adminAuth.role})`
-        : 'unknown'
+      const adminIdentity = `${adminAuth.name} (${adminAuth.role})`
       const scopeKeyValue = scope === 'GLOBAL' ? '' : scopeKey.trim()
       const result = await manualTripBreaker(
         scope,
@@ -1752,8 +2090,14 @@ router.post(
  */
 router.post(
   '/agent/breakers/:id/reset',
-  requireAdminScope('agent'),
+  requireAdminScope('agent:write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { reason } = req.body ?? {}
 
@@ -1765,9 +2109,7 @@ router.post(
         return
       }
 
-      const adminIdentity = res.locals.adminAuth
-        ? `${res.locals.adminAuth.name} (${res.locals.adminAuth.role})`
-        : 'unknown'
+      const adminIdentity = `${adminAuth.name} (${adminAuth.role})`
       const result = await manualResetBreaker(
         req.params.id,
         reason.trim(),
@@ -1791,6 +2133,198 @@ router.post(
       const message = error instanceof Error ? error.message : 'Unknown error'
       auditLog(req, res, 'RESET_AGENT_BREAKER', 'failure', { error: message })
       res.status(500).json({ success: false, error: message })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/treasury/emergency-sweep
+ * Always full multisig threshold — never reads requiresApprovalAbove.
+ * Required scope: treasury:write
+ */
+router.post(
+  '/treasury/emergency-sweep',
+  requireAdminScope('treasury:write'),
+  async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
+    try {
+      const { fromTier, toTier, asset, amount, reason } = req.body
+      const { executeEmergencySweep } = await import('../jobs/treasurySweep')
+      await executeEmergencySweep(
+        fromTier,
+        toTier,
+        asset,
+        amount,
+        adminAuth.name,
+        reason ?? 'manual_admin_action'
+      )
+      auditLog(req, res, 'TREASURY_EMERGENCY_SWEEP', 'success', {
+        fromTier,
+        toTier,
+        asset,
+        amount,
+      })
+      res.status(201).json({
+        success: true,
+        data: { status: 'submitted' },
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      auditLog(req, res, 'TREASURY_EMERGENCY_SWEEP', 'failure', {
+        error: message,
+      })
+      res.status(400).json({ success: false, error: message })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/treasury/policies
+ * Creates a new (versioned) sweep policy for a tier pair. Required scope: treasury:write
+ */
+router.post(
+  '/treasury/policies',
+  requireAdminScope('treasury:write'),
+  async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
+    try {
+      const { createPolicyVersion } = await import('../treasury/policy')
+      const policy = await createPolicyVersion(req.body, adminAuth.name)
+      auditLog(req, res, 'TREASURY_POLICY_CREATE', 'success', {
+        fromTier: req.body.fromTier,
+        toTier: req.body.toTier,
+        version: policy.version,
+      })
+      res.status(201).json({
+        success: true,
+        data: policy,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      auditLog(req, res, 'TREASURY_POLICY_CREATE', 'failure', {
+        error: message,
+      })
+      res.status(400).json({ success: false, error: message })
+    }
+  }
+)
+
+/**
+ * GET /api/admin/treasury/policies
+ * Lists active sweep policies. Required scope: treasury:read
+ */
+router.get(
+  '/treasury/policies',
+  requireAdminScope('treasury:read'),
+  async (_req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
+    try {
+      const policies = await db.treasurySweepPolicy.findMany({
+        where: { isActive: true },
+      })
+      res.status(200).json({
+        success: true,
+        data: policies,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      res.status(500).json({ success: false, error: message })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/treasury/signer-rotations
+ * Initiates a signer rotation into DUAL_ACTIVE. Required scope: treasury:write
+ */
+router.post(
+  '/treasury/signer-rotations',
+  requireAdminScope('treasury:write'),
+  async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
+    try {
+      const { treasuryAccountId, oldSignerKey, newSignerKey } = req.body
+      const { initiateRotation } = await import('../treasury/signerRotation')
+      const rotation = await initiateRotation(
+        treasuryAccountId,
+        oldSignerKey,
+        newSignerKey,
+        adminAuth.name
+      )
+      auditLog(req, res, 'TREASURY_SIGNER_ROTATION_INITIATE', 'success', {
+        rotationId: rotation.id,
+        treasuryAccountId,
+      })
+      res.status(201).json({
+        success: true,
+        data: rotation,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      auditLog(req, res, 'TREASURY_SIGNER_ROTATION_INITIATE', 'failure', {
+        error: message,
+      })
+      res.status(400).json({ success: false, error: message })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/treasury/signer-rotations/:id/finalize
+ * Finalizes a DUAL_ACTIVE rotation. Required scope: treasury:write
+ */
+router.post(
+  '/treasury/signer-rotations/:id/finalize',
+  requireAdminScope('treasury:write'),
+  async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
+    try {
+      const { finalizeRotation } = await import('../treasury/signerRotation')
+      const rotation = await finalizeRotation(req.params.id, adminAuth.name)
+      auditLog(req, res, 'TREASURY_SIGNER_ROTATION_FINALIZE', 'success', {
+        rotationId: req.params.id,
+      })
+      res.status(200).json({
+        success: true,
+        data: rotation,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      auditLog(req, res, 'TREASURY_SIGNER_ROTATION_FINALIZE', 'failure', {
+        rotationId: req.params.id,
+        error: message,
+      })
+      res.status(400).json({ success: false, error: message })
     }
   }
 )
@@ -1835,9 +2369,7 @@ router.get(
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error'
       auditLog(req, res, 'MESSAGES_LIST', 'failure', { error: message })
-      res
-        .status(500)
-        .json({ success: false, error: 'Failed to list messages' })
+      res.status(500).json({ success: false, error: 'Failed to list messages' })
     }
   }
 )
@@ -2019,3 +2551,388 @@ router.delete(
 
 export default router
 
+// ── Privacy Erasure Routes (#489) ───────────────────────────────────────────
+
+import {
+  createErasureRequest,
+  approveErasureRequest,
+  rejectErasureRequest,
+  executeErasure,
+  listErasureRequests,
+  previewErasure,
+} from '../compliance/privacyErasure'
+
+/**
+ * GET /api/admin/erasure/requests
+ * List all erasure requests with optional status filter.
+ * Required scope: read
+ */
+router.get(
+  '/erasure/requests',
+  requireAdminScope('read'),
+  async (req: Request, res: Response) => {
+    try {
+      const { status, limit, offset } = req.query
+      const result = await listErasureRequests({
+        status: status as any,
+        limit: limit ? parseInt(limit as string) : undefined,
+        offset: offset ? parseInt(offset as string) : undefined,
+      })
+
+      res.json({
+        success: true,
+        data: result,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to list erasure requests', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error: 'Failed to list erasure requests',
+      })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/erasure/requests
+ * Create a new erasure request for a user.
+ * Required scope: write
+ *
+ * Body: { userId: string, reason: string }
+ */
+router.post(
+  '/erasure/requests',
+  requireAdminScope('write'),
+  async (req: Request, res: Response) => {
+    try {
+      const { userId, reason } = req.body
+      const adminAuth = res.locals.adminAuth
+
+      if (!userId || !reason) {
+        return res.status(400).json({
+          success: false,
+          error: 'userId and reason are required',
+        })
+      }
+
+      const request = await createErasureRequest(userId, adminAuth.name, reason)
+
+      auditLog(req, res, 'CREATE_ERASURE_REQUEST', 'success', {
+        requestId: request.id,
+        userId,
+      })
+
+      res.status(201).json({
+        success: true,
+        data: request,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to create erasure request', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      auditLog(req, res, 'CREATE_ERASURE_REQUEST', 'failure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to create request',
+      })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/erasure/requests/:id/approve
+ * Approve an erasure request.
+ * Required scope: super
+ */
+router.post(
+  '/erasure/requests/:id/approve',
+  requireAdminScope('super'),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params
+      const adminAuth = res.locals.adminAuth
+
+      const request = await approveErasureRequest(id, adminAuth.name)
+
+      auditLog(req, res, 'APPROVE_ERASURE_REQUEST', 'success', {
+        requestId: id,
+      })
+
+      res.json({
+        success: true,
+        data: request,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to approve erasure request', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      auditLog(req, res, 'APPROVE_ERASURE_REQUEST', 'failure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to approve request',
+      })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/erasure/requests/:id/reject
+ * Reject an erasure request.
+ * Required scope: super
+ *
+ * Body: { rejectionReason: string }
+ */
+router.post(
+  '/erasure/requests/:id/reject',
+  requireAdminScope('super'),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params
+      const { rejectionReason } = req.body
+      const adminAuth = res.locals.adminAuth
+
+      if (!rejectionReason) {
+        return res.status(400).json({
+          success: false,
+          error: 'rejectionReason is required',
+        })
+      }
+
+      const request = await rejectErasureRequest(
+        id,
+        adminAuth.name,
+        rejectionReason
+      )
+
+      auditLog(req, res, 'REJECT_ERASURE_REQUEST', 'success', {
+        requestId: id,
+      })
+
+      res.json({
+        success: true,
+        data: request,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to reject erasure request', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      auditLog(req, res, 'REJECT_ERASURE_REQUEST', 'failure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to reject request',
+      })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/erasure/requests/:id/execute
+ * Execute an approved erasure request. THIS IS IRREVERSIBLE.
+ * Required scope: super
+ */
+router.post(
+  '/erasure/requests/:id/execute',
+  requireAdminScope('super'),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params
+
+      const summary = await executeErasure(id)
+
+      auditLog(req, res, 'EXECUTE_ERASURE', 'success', {
+        requestId: id,
+        summary,
+      })
+
+      res.json({
+        success: true,
+        data: summary,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to execute erasure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      auditLog(req, res, 'EXECUTE_ERASURE', 'failure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to execute erasure',
+      })
+    }
+  }
+)
+
+/**
+ * GET /api/admin/erasure/preview/:userId
+ * Preview what would be deleted for a user.
+ * Required scope: read
+ */
+router.get(
+  '/erasure/preview/:userId',
+  requireAdminScope('read'),
+  async (req: Request, res: Response) => {
+    try {
+      const { userId } = req.params
+
+      const preview = await previewErasure(userId)
+
+      res.json({
+        success: true,
+        data: preview,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to preview erasure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error: 'Failed to preview erasure',
+      })
+    }
+  }
+)
+
+// ── Referral Fraud Review Routes (#490) ─────────────────────────────────────
+
+import {
+  listConversionsForReview,
+  approveReferralConversion,
+  rejectReferralConversion,
+} from '../referral/service'
+
+/**
+ * GET /api/admin/referrals/review
+ * List referral conversions flagged for manual review.
+ * Required scope: read
+ */
+router.get(
+  '/referrals/review',
+  requireAdminScope('read'),
+  async (req: Request, res: Response) => {
+    try {
+      const conversions = await listConversionsForReview()
+
+      res.json({
+        success: true,
+        data: conversions,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to list referral reviews', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error: 'Failed to list referral reviews',
+      })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/referrals/review/:id/approve
+ * Approve a referral conversion after manual review.
+ * Required scope: write
+ */
+router.post(
+  '/referrals/review/:id/approve',
+  requireAdminScope('write'),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params
+      const adminAuth = res.locals.adminAuth
+
+      await approveReferralConversion(id, adminAuth.name)
+
+      auditLog(req, res, 'APPROVE_REFERRAL', 'success', { conversionId: id })
+
+      res.json({
+        success: true,
+        message: 'Referral conversion approved',
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to approve referral conversion', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      auditLog(req, res, 'APPROVE_REFERRAL', 'failure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to approve referral',
+      })
+    }
+  }
+)
+
+/**
+ * POST /api/admin/referrals/review/:id/reject
+ * Reject a referral conversion after manual review.
+ * Required scope: write
+ *
+ * Body: { rejectionReason: string }
+ */
+router.post(
+  '/referrals/review/:id/reject',
+  requireAdminScope('write'),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params
+      const { rejectionReason } = req.body
+      const adminAuth = res.locals.adminAuth
+
+      if (!rejectionReason) {
+        return res.status(400).json({
+          success: false,
+          error: 'rejectionReason is required',
+        })
+      }
+
+      await rejectReferralConversion(id, adminAuth.name, rejectionReason)
+
+      auditLog(req, res, 'REJECT_REFERRAL', 'success', {
+        conversionId: id,
+        reason: rejectionReason,
+      })
+
+      res.json({
+        success: true,
+        message: 'Referral conversion rejected',
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error: any) {
+      logger.error('[Admin] Failed to reject referral conversion', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      auditLog(req, res, 'REJECT_REFERRAL', 'failure', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to reject referral',
+      })
+    }
+  }
+)

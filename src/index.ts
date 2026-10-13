@@ -25,10 +25,15 @@ import yaml from 'js-yaml'
 import { config } from './config/env'
 import { errorHandler } from './middleware/errorHandler'
 import { correlationIdMiddleware } from './middleware/correlationId'
+import {
+  errorResponseMiddleware,
+  notFoundHandler,
+} from './middleware/errorResponse'
 import { requestLogger } from './middleware/logger'
 import { requestTimeoutMiddleware } from './middleware/requestTimeout'
 import {
   rateLimiter,
+  tieredRateLimiter,
   authRateLimiter,
   adminRateLimiter,
   internalRateLimiter,
@@ -49,6 +54,7 @@ import { schedulePoolMetrics } from './jobs/poolMetrics'
 import { scheduleFiatReconciliation } from './jobs/fiatReconciliation'
 import { scheduleReferralPayout } from './jobs/referralPayout'
 import { scheduleRecurringDeposits } from './jobs/recurringDeposits'
+import { scheduleRecurringWithdrawals } from './jobs/recurringWithdrawals'
 import { scheduleAlertRules } from './jobs/alertRules'
 import { scheduleStrategyMetrics } from './jobs/strategyMetrics'
 import { scheduleAllocationSuggestions } from './jobs/allocationSuggestions'
@@ -60,6 +66,9 @@ import { schedulePortfolioRiskJob } from './jobs/portfolioRisk'
 import { scheduleApprovalExpiry } from './jobs/approvalExpiry'
 import { scheduleReserveReconciliation } from './jobs/reserveReconciliation'
 import { scheduleMessageDeliverySweep } from './jobs/messageDeliverySweep'
+import { scheduleLoanAccrual } from './jobs/loanAccrual'
+import { scheduleLoanLiquidationMonitor } from './jobs/loanLiquidationMonitor'
+import { scheduleLinkedExternalWalletSync } from './jobs/linkedExternalWalletSync'
 import { startEventListener, stopEventListener } from './stellar/events'
 import { startEventBridge, stopEventBridge } from './events/bridge'
 import { attachWebSocketServer, closeWebSocketServer } from './ws/server'
@@ -75,6 +84,9 @@ import transactionsRouter from './routes/transactions'
 import protocolsRouter from './routes/protocols'
 import depositRouter from './routes/deposit'
 import withdrawRouter from './routes/withdraw'
+import loansRouter from './routes/loans'
+import protectionFundRouter from './routes/protection-fund'
+import settingsRouter from './routes/settings'
 import vaultRouter from './routes/vault'
 import analyticsRouter from './routes/analytics'
 import adminRouter from './routes/admin'
@@ -84,25 +96,34 @@ import webhooksRouter from './routes/webhooks'
 import fiatRouter from './routes/fiat'
 import referralsRouter from './routes/referrals'
 import recurringDepositRouter from './routes/recurring-deposits'
+import recurringWithdrawalRouter from './routes/recurring-withdrawals'
 import alertsRouter from './routes/alerts'
 import strategiesRouter from './routes/strategies'
 import subAccountsRouter from './routes/sub-accounts'
+import supportTicketsRouter from './routes/support-tickets'
+import adminSupportTicketsRouter from './routes/admin/support-tickets'
 import assistantRouter from './routes/assistant'
 import approvalsRouter from './routes/approvals'
 import approvalPoliciesRouter from './routes/approval-policies'
 import keysRouter from './routes/keys'
 import sessionsRouter from './routes/sessions'
+import webAuthnRouter from './routes/webauthn'
 import streamRouter from './routes/stream'
 import notificationsRouter from './routes/notifications'
+import liquidityFloorRouter from './routes/liquidity-floor'
+import notificationDlqRouter from './routes/notification-dlq'
 import networkRouter from './routes/network'
+import netWorthRouter from './routes/net-worth'
 import {
   corsMiddleware,
   jsonBodyParser,
   payloadSizeErrorHandler,
   urlencodedBodyParser,
   contentTypeRestrictionMiddleware,
+  validateCorsConfig,
 } from './middleware/corsandbody'
 import { setSpanUser } from './telemetry/spans'
+import { scheduleOutboundNotifications } from './services/outboundNotifications'
 
 // ── Readiness state ───────────────────────────────────────────────────────────
 
@@ -125,6 +146,7 @@ let poolMetricsHandle: NodeJS.Timeout | null = null
 let fiatReconciliationHandle: NodeJS.Timeout | null = null
 let referralPayoutHandle: NodeJS.Timeout | null = null
 let recurringDepositsHandle: NodeJS.Timeout | null = null
+let recurringWithdrawalsHandle: NodeJS.Timeout | null = null
 let alertRulesHandle: NodeJS.Timeout | null = null
 let strategyMetricsHandle: NodeJS.Timeout | null = null
 let allocationSuggestionsHandle: NodeJS.Timeout | null = null
@@ -135,9 +157,29 @@ let portfolioRiskJobHandle: NodeJS.Timeout | null = null
 let approvalExpiryHandle: NodeJS.Timeout | null = null
 let reserveReconciliationHandle: NodeJS.Timeout | null = null
 let messageDeliverySweepHandle: NodeJS.Timeout | null = null
+let outboundNotificationsHandle: NodeJS.Timeout | null = null
+let linkedExternalWalletSyncHandle: NodeJS.Timeout | null = null
+let loanAccrualHandle: NodeJS.Timeout | null = null
+let loanLiquidationHandle: NodeJS.Timeout | null = null
 
 function allServicesReady(): boolean {
   return Object.values(serviceStatus).every((s) => s.ready)
+}
+
+// ── Configuration validation ──────────────────────────────────────────────────
+
+// A production or staging deployment that cannot enforce a CORS allowlist must
+// not start: every browser request would 403, and shipping that as a
+// half-working service is worse than failing loudly at boot (#471).
+try {
+  validateCorsConfig()
+} catch (error) {
+  logger.error(
+    `[CORS] Fatal startup error: ${
+      error instanceof Error ? error.message : String(error)
+    }`
+  )
+  process.exit(1)
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -149,6 +191,12 @@ configureTrustProxy(app)
 // ── Security and parsing middleware ───────────────────────────────────────────
 
 app.disable('x-powered-by')
+// Correlation ID — must run first so every response, including early
+// rejections from CORS / body parsing / rate limiting, carries X-Request-ID.
+app.use(correlationIdMiddleware)
+// Standard error envelope — wraps res.json so every later 4xx/5xx response
+// (including CORS, body parsing, auth and rate limiting) shares one shape.
+app.use(errorResponseMiddleware)
 app.use(securityHeaders())
 app.use(permissionsPolicy())
 app.use(corsMiddleware)
@@ -163,9 +211,6 @@ app.use(
 )
 app.use(jsonBodyParser)
 app.use(urlencodedBodyParser)
-
-// Correlation ID — must run before requestLogger
-app.use(correlationIdMiddleware)
 
 // ── User context propagation ──────────────────────────────────────────────────
 //
@@ -189,6 +234,13 @@ app.use((req: Request & { user?: { id: string } }, _res: Response, next) => {
 app.use(requestLogger)
 app.use(trustedIpBypass)
 app.use(rateLimiter)
+// #473 — identity tiering. This single limiter charges anonymous callers to a
+// strict per-IP budget and authenticated callers to a generous per-principal one
+// (see tieredRateLimiter). It resolves identity from the request itself, so it
+// works here, ahead of each route's auth middleware: API keys are self-
+// describing in the Authorization header, and session tokens are classified once
+// the auth middleware has resolved req.userId.
+app.use(tieredRateLimiter)
 app.use(requestTimeoutMiddleware)
 
 // Advertise the served API version on every response — must be registered
@@ -299,9 +351,12 @@ interface ApiRoute {
 
 const apiRoutes: ApiRoute[] = [
   { path: 'network', handlers: [networkRouter] },
+  { path: 'net-worth', handlers: [netWorthRouter] },
   { path: 'agent/decisions', handlers: [agentDecisionsRouter] },
   { path: 'agent', handlers: [internalRateLimiter, agentRouter] },
+  { path: 'auth/webauthn', handlers: [authRateLimiter, webAuthnRouter] },
   { path: 'auth', handlers: [authRateLimiter, authRouter] },
+  { path: 'webauthn', handlers: [authRateLimiter, webAuthnRouter] },
   { path: 'whatsapp', handlers: [webhookRateLimiter, whatsappRouter] },
   { path: 'telegram', handlers: [webhookRateLimiter, telegramRouter] },
   { path: 'portfolio', handlers: [portfolioRouter] },
@@ -309,15 +364,29 @@ const apiRoutes: ApiRoute[] = [
   { path: 'protocols', handlers: [protocolsRouter] },
   { path: 'deposit', handlers: [depositRouter] },
   { path: 'withdraw', handlers: [withdrawRouter] },
+  // #532 — collateral loans. Mounted beside withdraw rather than inside
+  // portfolio: a loan is its own lifecycle with its own approval and rate
+  // limits, and it must not inherit portfolio's read-only scope set.
+  { path: 'loans', handlers: [loansRouter] },
+  // #533 — protocol-risk protection fund
+  { path: 'protection-fund', handlers: [protectionFundRouter] },
+  // #534 — user settings (display currency)
+  { path: 'settings', handlers: [settingsRouter] },
   { path: 'vault', handlers: [vaultRouter] },
   { path: 'analytics', handlers: [analyticsRouter] },
   { path: 'stellar', handlers: [stellarRouter] },
   { path: 'fiat', handlers: [fiatRouter] },
   { path: 'referrals', handlers: [referralsRouter] },
   { path: 'deposit/recurring', handlers: [recurringDepositRouter] },
+  { path: 'recurring-withdrawals', handlers: [recurringWithdrawalRouter] },
   { path: 'alerts', handlers: [alertsRouter] },
   { path: 'strategies', handlers: [strategiesRouter] },
   { path: 'sub-accounts', handlers: [subAccountsRouter] },
+  { path: 'support/tickets', handlers: [supportTicketsRouter] },
+  {
+    path: 'admin/support/tickets',
+    handlers: [adminRateLimiter, adminSupportTicketsRouter],
+  },
   { path: 'assistant', handlers: [assistantRouter] },
   { path: 'approvals', handlers: [approvalsRouter] },
   { path: 'approval-policies', handlers: [approvalPoliciesRouter] },
@@ -325,6 +394,11 @@ const apiRoutes: ApiRoute[] = [
   { path: 'sessions', handlers: [sessionsRouter] },
   { path: 'stream', handlers: [streamRouter] },
   { path: 'notifications', handlers: [notificationsRouter] },
+  { path: 'liquidity-floor', handlers: [liquidityFloorRouter] },
+  {
+    path: 'admin/notifications/dlq',
+    handlers: [adminRateLimiter, notificationDlqRouter],
+  },
   { path: 'admin', handlers: [adminRateLimiter, adminRouter] },
 ]
 
@@ -346,6 +420,9 @@ for (const route of apiRoutes) {
   app.use(`/api/${route.path}`, deprecatedApiWarning, ...route.handlers)
 }
 
+// 404 for unmatched routes — after all routers, before the error handlers
+app.use(notFoundHandler)
+
 // 413 handler — must be after body parsers, before generic error handler
 app.use(payloadSizeErrorHandler)
 
@@ -362,6 +439,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
     clearInterval(sessionCleanupHandle)
     sessionCleanupHandle = null
     logger.info('[Shutdown] Session cleanup timer cleared')
+  }
+
+  if (outboundNotificationsHandle) {
+    clearInterval(outboundNotificationsHandle)
+    outboundNotificationsHandle = null
   }
 
   if (dataRetentionHandle) {
@@ -392,6 +474,10 @@ async function gracefulShutdown(signal: string): Promise<void> {
     clearInterval(recurringDepositsHandle)
     recurringDepositsHandle = null
     logger.info('[Shutdown] Recurring deposits timer cleared')
+  }
+  if (recurringWithdrawalsHandle) {
+    clearInterval(recurringWithdrawalsHandle)
+    recurringWithdrawalsHandle = null
   }
 
   if (alertRulesHandle) {
@@ -452,6 +538,24 @@ async function gracefulShutdown(signal: string): Promise<void> {
     clearInterval(messageDeliverySweepHandle)
     messageDeliverySweepHandle = null
     logger.info('[Shutdown] Message delivery sweep timer cleared')
+  }
+
+  if (linkedExternalWalletSyncHandle) {
+    clearInterval(linkedExternalWalletSyncHandle)
+    linkedExternalWalletSyncHandle = null
+    logger.info('[Shutdown] External wallet sync timer cleared')
+  }
+
+  if (loanAccrualHandle) {
+    clearInterval(loanAccrualHandle)
+    loanAccrualHandle = null
+    logger.info('[Shutdown] Loan accrual timer cleared')
+  }
+
+  if (loanLiquidationHandle) {
+    clearInterval(loanLiquidationHandle)
+    loanLiquidationHandle = null
+    logger.info('[Shutdown] Loan liquidation monitor cleared')
   }
 
   try {
@@ -515,6 +619,13 @@ async function initServices(): Promise<void> {
   // 0. Bootstrap secrets (no-op when SECRET_BACKEND=env, fetches from SSM otherwise)
   const { bootstrapSecrets } = await import('./config/secrets')
   await bootstrapSecrets()
+  const { validateSecretCredentials } = await import('./config/secrets')
+  const secretErrors = validateSecretCredentials()
+  if (secretErrors.length) {
+    throw new Error(
+      `[Startup] Secret validation failed: ${secretErrors.join('; ')}`
+    )
+  }
 
   if (config.nodeEnv === 'production') {
     logger.info(
@@ -656,6 +767,7 @@ async function main(): Promise<void> {
   fiatReconciliationHandle = scheduleFiatReconciliation()
   referralPayoutHandle = scheduleReferralPayout()
   recurringDepositsHandle = scheduleRecurringDeposits()
+  recurringWithdrawalsHandle = scheduleRecurringWithdrawals()
   alertRulesHandle = scheduleAlertRules()
   strategyMetricsHandle = scheduleStrategyMetrics()
   // Ordered before the suggestion job so the first suggestion run sees freshly
@@ -667,6 +779,12 @@ async function main(): Promise<void> {
   approvalExpiryHandle = scheduleApprovalExpiry()
   reserveReconciliationHandle = scheduleReserveReconciliation()
   messageDeliverySweepHandle = scheduleMessageDeliverySweep()
+  outboundNotificationsHandle = scheduleOutboundNotifications()
+  linkedExternalWalletSyncHandle = scheduleLinkedExternalWalletSync()
+  // #532 — accrual first, then the monitor: the monitor values loans, and it
+  // must not value them on interest the accrual job has not yet recorded.
+  loanAccrualHandle = scheduleLoanAccrual()
+  loanLiquidationHandle = scheduleLoanLiquidationMonitor()
 }
 
 // ── Process-level error guards ────────────────────────────────────────────────
