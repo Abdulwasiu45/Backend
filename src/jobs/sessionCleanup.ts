@@ -10,8 +10,20 @@ import { recordJobSuccess, recordJobFailure } from '../utils/job-metrics'
 import { scheduleResilientJob } from './resilientScheduler'
 
 /**
- * Delete all sessions whose expiration timestamp is in the past.
+ * Purge sessions that can no longer be used by anyone.
  * Safe to call multiple times — it is idempotent.
+ *
+ * #472: "expired" used to mean `expiresAt < now`, which is the *access* token
+ * expiry. Refresh tokens live for 7 days while an access token lives for 15
+ * minutes, so this job was deleting sessions whose refresh token was still
+ * valid — quietly logging users out mid-session and making the whole refresh
+ * flow pointless. A session is only purged when both halves are dead:
+ *
+ *   - live session:   access token expired AND (no refresh token OR refresh expired)
+ *   - revoked session: already soft-revoked, kept for the retention window
+ *
+ * Soft-revocation state is preserved for `config.sessions.revokedRetainDays` so
+ * a user can still see, and investigators can still read, what was terminated.
  */
 export async function cleanupExpiredSessions(): Promise<void> {
   const correlationId = generateCorrelationId()
@@ -27,7 +39,17 @@ export async function cleanupExpiredSessions(): Promise<void> {
 
       const [expiredResult, revokedResult] = await Promise.all([
         db.session.deleteMany({
-          where: { expiresAt: { lt: now } },
+          where: {
+            expiresAt: { lt: now },
+            revokedAt: null,
+            OR: [
+              // Revoke-aware: #472 cleared the refresh columns on revocation, so a
+              // revoked session can never match this branch. Stated explicitly so
+              // a future change to revokeSession() cannot silently break it.
+              { refreshTokenExpiresAt: null },
+              { refreshTokenExpiresAt: { lt: now } },
+            ],
+          },
         }),
         db.session.deleteMany({
           where: {

@@ -53,6 +53,9 @@ const WEBHOOK_EVENTS = [
   'approval.executed',
   'approval.expired',
   'approval.cancelled',
+  // Lending events (#532)
+  'loan.liquidation_executed',
+  'loan.charged_off',
 ] as const
 
 export const createWebhookSchema = z.object({
@@ -77,9 +80,8 @@ export const createUserWebhookEndpointSchema = z.object({
   events: z
     .array(z.enum(WEBHOOK_EVENTS))
     .min(1, 'At least one event is required'),
-  topicScope: z
-    .array(z.string())
-    .optional(),
+  topicScope: z.array(z.string()).optional(),
+  // zod v4 requires explicit key and value schemas for records.
   filterJson: z.record(z.string(), z.any()).nullable().optional(),
 })
 
@@ -89,13 +91,10 @@ export const updateUserWebhookEndpointSchema = z.object({
     .array(z.enum(WEBHOOK_EVENTS))
     .min(1, 'At least one event is required')
     .optional(),
-  topicScope: z
-    .array(z.string())
-    .optional(),
+  topicScope: z.array(z.string()).optional(),
+  // zod v4 requires explicit key and value schemas for records.
   filterJson: z.record(z.string(), z.any()).nullable().optional(),
-  status: z
-    .enum(['ACTIVE', 'PAUSED', 'DISABLED'])
-    .optional(),
+  status: z.enum(['ACTIVE', 'PAUSED', 'DISABLED']).optional(),
 })
 
 export const userWebhookEndpointIdParamSchema = z.object({

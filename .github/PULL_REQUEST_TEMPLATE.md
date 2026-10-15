@@ -23,6 +23,28 @@
 - [ ] All new and existing tests pass (`npm test`)
 - [ ] I have updated documentation accordingly
 
+## Database Migration (only if `prisma/migrations/**` changed)
+
+<!-- See docs/MIGRATIONS.md for the full process. Delete this section otherwise. -->
+
+**Class** (A metadata / B blocking DDL / C backfill / D irreversible):
+
+**Backup taken** (snapshot identifier, or `n/a` for class A):
+
+**Downtime impact**
+
+- Locks taken: <!-- ACCESS EXCLUSIVE / ROW EXCLUSIVE / none -->
+- Expected lock duration:
+- Writes blocked during migration: <!-- yes / no -->
+- Requires traffic drain: <!-- yes / no -->
+- Rollback tier: <!-- 1 app-only / 2 rollback.sql / 3 snapshot restore -->
+
+- [ ] `rollback.sql` ships in the same commit and is idempotent
+- [ ] Rollback rehearsed with `bash scripts/rehearse-migration-rollback.sh`
+- [ ] Added columns are nullable or defaulted (previous app version keeps working)
+- [ ] Indexes on request-path tables use `CREATE INDEX CONCURRENTLY`
+- [ ] Previous application version still works against the new schema
+
 ## Screenshots (if applicable)
 
 <!-- Add screenshots to help explain your changes -->

@@ -564,7 +564,7 @@ psql "$DATABASE_URL" -c "SELECT scope, \"scopeKey\", state, \"trippedRule\" FROM
 
 ---
 
-## 8. Feature Flags & Emergency Rollback Runbook (#494)
+## 10. Feature Flags & Emergency Rollback Runbook (#494)
 
 Detailed reference and architectural specifications are documented in [docs/FEATURE_FLAGS.md](FEATURE_FLAGS.md).
 
@@ -631,4 +631,43 @@ FEATURE_FLAG_SMART_DCA_ENGINE_KILL_SWITCH=true
 curl -X POST http://localhost:3001/api/v1/admin/feature-flags/smart_dca_engine/reset \
   -H "Authorization: Bearer $ADMIN_API_TOKEN"
 ```
+
+---
+
+## 13. Telegram & WhatsApp Message Delivery Recovery (#493)
+
+### Alert: `telegram_dlq_high` / `whatsapp_dlq_high`
+Triggered when dead-lettered message count exceeds `MESSAGING_DLQ_ALERT_THRESHOLD` (default: 10).
+
+### Diagnostic commands
+```bash
+# Check queue metrics and dead-letter count
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" http://localhost:3001/api/v1/admin/messages/stats | jq
+
+# List failed / dead-lettered messages
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" "http://localhost:3001/api/v1/admin/messages?status=DEAD_LETTER&limit=20" | jq
+```
+
+### Recovery actions
+1. **Investigate Root Cause**: Inspect `lastError` on failed deliveries:
+   - 429 Rate Limits: Verify rate-limit configuration and exponential backoff settings.
+   - 403 Forbidden (Telegram): User blocked the bot; cancel message or re-route.
+   - 21211 (WhatsApp/Twilio): Invalid phone number format.
+2. **Bulk Retry Dead Letters**: Once downstream connectivity is restored:
+   ```bash
+   curl -X POST http://localhost:3001/api/v1/admin/messages/retry-dead-letters \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"channel": "TELEGRAM"}'
+   ```
+3. **Single Message Manual Retry**:
+   ```bash
+   curl -X POST http://localhost:3001/api/v1/admin/messages/<message-id>/retry \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN"
+   ```
+4. **Cancel Poison Messages**:
+   ```bash
+   curl -X DELETE http://localhost:3001/api/v1/admin/messages/<message-id> \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN"
+   ```
 

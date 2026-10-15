@@ -8,6 +8,7 @@
  * - DLQ size
  * - Cursor lag
  * - Agent loop heartbeat state
+ * - Queue lag, worker saturation, and throughput
  */
 
 import client from 'prom-client'
@@ -81,6 +82,32 @@ export const dlqRetryTotal = new client.Counter({
 export const dlqAlertActive = new client.Gauge({
   name: 'dlq_alert_active',
   help: 'Whether a DLQ size alert is currently active (1=active, 0=inactive)',
+  registers: [register],
+})
+
+export const outboundNotificationAttempts = new client.Counter({
+  name: 'outbound_notification_attempts_total',
+  help: 'Outbound notification delivery attempts by channel and outcome',
+  labelNames: ['channel', 'status'] as const,
+  registers: [register],
+})
+
+export const mailWebhookRejectionsTotal = new client.Counter({
+  name: 'mail_webhook_rejections_total',
+  help: 'Mail provider webhook deliveries rejected by the gateway',
+  labelNames: ['reason'] as const,
+  registers: [register],
+})
+
+export const outboundNotificationDlqSize = new client.Gauge({
+  name: 'outbound_notification_dlq_size',
+  help: 'Current number of outbound notifications in the dead-letter queue',
+  registers: [register],
+})
+
+export const secretCredentialValidationFailures = new client.Gauge({
+  name: 'secret_credential_validation_failures',
+  help: 'Number of missing, expired, or malformed configured secrets',
   registers: [register],
 })
 
@@ -164,6 +191,31 @@ export const agentSnapshotDuration = new client.Histogram({
   name: 'agent_snapshot_duration_seconds',
   help: 'Duration of balance snapshot operations in seconds',
   buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [register],
+})
+
+export const portfolioAnnualisedVolatilityPct = new client.Histogram({
+  name: 'portfolio_annualised_volatility_pct',
+  help: 'Annualised portfolio volatility observed by the rebalance circuit breaker, in percent',
+  buckets: [5, 10, 20, 30, 50, 75, 100, 150, 200],
+  registers: [register],
+})
+
+export const volatilityBreakerTripsTotal = new client.Counter({
+  name: 'portfolio_volatility_circuit_breaker_trips_total',
+  help: 'Total number of portfolio volatility circuit-breaker activations',
+  registers: [register],
+})
+
+export const volatilityBreakerActivePortfolios = new client.Gauge({
+  name: 'portfolio_volatility_circuit_breaker_active_portfolios',
+  help: 'Number of portfolios currently blocked by the volatility circuit breaker',
+  registers: [register],
+})
+
+export const volatilityBreakerEvaluationFailuresTotal = new client.Counter({
+  name: 'portfolio_volatility_circuit_breaker_evaluation_failures_total',
+  help: 'Total number of portfolio risk evaluations that failed closed',
   registers: [register],
 })
 
@@ -314,8 +366,8 @@ export const externalServiceErrorsTotal = new client.Counter({
 
 export const rateLimitHitsTotal = new client.Counter({
   name: 'rate_limit_hits_total',
-  help: 'Total number of rate limit hits by route group',
-  labelNames: ['route_group', 'limiter_type'] as const,
+  help: 'Total number of rate limit hits by route group, limiter tier and principal type',
+  labelNames: ['route_group', 'limiter_type', 'principal_type'] as const,
   registers: [register],
 })
 
@@ -451,6 +503,22 @@ export function recordRebalanceTriggered(): void {
   agentRebalancesTriggeredTotal.inc()
 }
 
+export function observePortfolioVolatility(volatilityPct: number): void {
+  portfolioAnnualisedVolatilityPct.observe(volatilityPct)
+}
+
+export function recordVolatilityBreakerTrip(): void {
+  volatilityBreakerTripsTotal.inc()
+}
+
+export function setVolatilityBreakerActivePortfolios(count: number): void {
+  volatilityBreakerActivePortfolios.set(count)
+}
+
+export function recordVolatilityBreakerEvaluationFailure(): void {
+  volatilityBreakerEvaluationFailuresTotal.inc()
+}
+
 /**
  * Record database operation duration
  */
@@ -529,11 +597,23 @@ export function recordExternalServiceError(
 /**
  * Record a rate limit hit
  */
+/**
+ * Record a request blocked by a rate limiter (#473).
+ *
+ * `principalType` is what makes this alertable: a rise in `anonymous` blocks is
+ * scraping or credential stuffing, while a rise in `authenticated` blocks is a
+ * broken client or a leaked key. Same 429 status, completely different incident.
+ */
 export function recordRateLimitHit(
   routeGroup: string,
-  limiterType: string
+  limiterType: string,
+  principalType: string = 'unknown'
 ): void {
-  rateLimitHitsTotal.inc({ route_group: routeGroup, limiter_type: limiterType })
+  rateLimitHitsTotal.inc({
+    route_group: routeGroup,
+    limiter_type: limiterType,
+    principal_type: principalType,
+  })
 }
 
 /**
@@ -554,10 +634,11 @@ export function updateRateLimitViolations(
 }
 
 /**
- * Record a rejected request due to size or content-type
+ * Record a request rejected before it reached a route handler — oversized
+ * payload, disallowed content type, or a CORS origin failure (#471).
  */
 export function recordRejectedRequest(
-  reason: 'oversized' | 'content_type'
+  reason: 'oversized' | 'content_type' | 'cors_origin' | 'cors_misconfiguration'
 ): void {
   rejectedRequestsTotal.inc({ reason })
 }
@@ -992,6 +1073,242 @@ export function setFeatureFlagRolloutGauge(
   percentage: number
 ): void {
   featureFlagRolloutPercentage.set({ flag }, percentage)
+}
+
+// ── Message Delivery Metrics (#493) ──────────────────────────────────────────────
+export const messageDeliveriesTotal = new client.Counter({
+  name: 'message_deliveries_total',
+  help: 'Total number of Telegram and WhatsApp message deliveries by status',
+  labelNames: ['channel', 'status', 'category'] as const,
+  registers: [register],
+})
+
+export const messageRetriesTotal = new client.Counter({
+  name: 'message_retries_total',
+  help: 'Total number of message retry attempts',
+  labelNames: ['channel'] as const,
+  registers: [register],
+})
+
+export const messageFallbacksTotal = new client.Counter({
+  name: 'message_fallbacks_total',
+  help: 'Total number of message channel fallbacks triggered',
+  labelNames: ['from_channel', 'to_channel'] as const,
+  registers: [register],
+})
+
+export const messageDeadLettersTotal = new client.Counter({
+  name: 'message_dead_letters_total',
+  help: 'Total number of messages moved to dead-letter state',
+  labelNames: ['channel'] as const,
+  registers: [register],
+})
+
+export const messageQueueDepth = new client.Gauge({
+  name: 'message_queue_depth',
+  help: 'Current number of messages in delivery queue by channel and status',
+  labelNames: ['channel', 'status'] as const,
+  registers: [register],
+})
+
+export const messageDeliveryDuration = new client.Histogram({
+  name: 'message_delivery_duration_seconds',
+  help: 'Latency of message delivery attempts by channel',
+  labelNames: ['channel'] as const,
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [register],
+})
+
+export function recordMessageDelivery(
+  channel: string,
+  status: string,
+  category: string = 'NOTIFICATION',
+  durationSeconds?: number
+): void {
+  messageDeliveriesTotal.inc({ channel, status, category })
+  if (durationSeconds !== undefined && durationSeconds >= 0) {
+    messageDeliveryDuration.observe({ channel }, durationSeconds)
+  }
+}
+
+export function recordMessageRetry(channel: string): void {
+  messageRetriesTotal.inc({ channel })
+}
+
+export function recordMessageFallback(
+  fromChannel: string,
+  toChannel: string
+): void {
+  messageFallbacksTotal.inc({
+    from_channel: fromChannel,
+    to_channel: toChannel,
+  })
+}
+
+export function recordMessageDeadLetter(channel: string): void {
+  messageDeadLettersTotal.inc({ channel })
+}
+
+export function updateMessageQueueDepth(
+  channel: string,
+  status: string,
+  depth: number
+): void {
+  messageQueueDepth.set({ channel, status }, depth)
+}
+
+// ── Queue Health Metrics (#520) ─────────────────────────────────────────────
+
+export const queueLagSeconds = new client.Gauge({
+  name: 'queue_lag_seconds',
+  help: 'Time in seconds that the oldest item has been waiting in the queue',
+  labelNames: ['queue_name'] as const,
+  registers: [register],
+})
+
+export const queueDepth = new client.Gauge({
+  name: 'queue_depth',
+  help: 'Current number of items in the queue',
+  labelNames: ['queue_name'] as const,
+  registers: [register],
+})
+
+export const queueThroughputPerSecond = new client.Gauge({
+  name: 'queue_throughput_per_second',
+  help: 'Items processed per second (rolling 1-minute average)',
+  labelNames: ['queue_name'] as const,
+  registers: [register],
+})
+
+export const workerSaturation = new client.Gauge({
+  name: 'worker_saturation',
+  help: 'Worker utilization as a percentage (0-100)',
+  labelNames: ['worker_type'] as const,
+  registers: [register],
+})
+
+export const workerActiveCount = new client.Gauge({
+  name: 'worker_active_count',
+  help: 'Number of currently active workers',
+  labelNames: ['worker_type'] as const,
+  registers: [register],
+})
+
+export const workerIdleCount = new client.Gauge({
+  name: 'worker_idle_count',
+  help: 'Number of currently idle workers',
+  labelNames: ['worker_type'] as const,
+  registers: [register],
+})
+
+export const workerProcessingDuration = new client.Histogram({
+  name: 'worker_processing_duration_seconds',
+  help: 'Duration of worker task processing in seconds',
+  labelNames: ['worker_type', 'queue_name'] as const,
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [register],
+})
+
+export const queueProcessingErrorsTotal = new client.Counter({
+  name: 'queue_processing_errors_total',
+  help: 'Total number of queue processing errors',
+  labelNames: ['queue_name', 'error_type'] as const,
+  registers: [register],
+})
+
+export const queueBlockedSeconds = new client.Gauge({
+  name: 'queue_blocked_seconds',
+  help: 'Time in seconds the queue has been blocked (unable to process)',
+  labelNames: ['queue_name'] as const,
+  registers: [register],
+})
+
+/**
+ * Record queue lag (age of oldest item)
+ */
+export function recordQueueLag(queueName: string, lagSeconds: number): void {
+  queueLagSeconds.set({ queue_name: queueName }, lagSeconds)
+}
+
+/**
+ * Record queue depth (number of items)
+ */
+export function recordQueueDepth(queueName: string, depth: number): void {
+  queueDepth.set({ queue_name: queueName }, depth)
+}
+
+/**
+ * Record queue throughput (items per second)
+ */
+export function recordQueueThroughput(
+  queueName: string,
+  throughput: number
+): void {
+  queueThroughputPerSecond.set({ queue_name: queueName }, throughput)
+}
+
+/**
+ * Record worker saturation (utilization percentage)
+ */
+export function recordWorkerSaturation(
+  workerType: string,
+  saturation: number
+): void {
+  workerSaturation.set({ worker_type: workerType }, saturation)
+}
+
+/**
+ * Record active worker count
+ */
+export function recordWorkerActiveCount(
+  workerType: string,
+  count: number
+): void {
+  workerActiveCount.set({ worker_type: workerType }, count)
+}
+
+/**
+ * Record idle worker count
+ */
+export function recordWorkerIdleCount(workerType: string, count: number): void {
+  workerIdleCount.set({ worker_type: workerType }, count)
+}
+
+/**
+ * Record worker processing duration
+ */
+export function recordWorkerProcessingDuration(
+  workerType: string,
+  queueName: string,
+  durationSeconds: number
+): void {
+  workerProcessingDuration.observe(
+    { worker_type: workerType, queue_name: queueName },
+    durationSeconds
+  )
+}
+
+/**
+ * Record queue processing error
+ */
+export function recordQueueProcessingError(
+  queueName: string,
+  errorType: string
+): void {
+  queueProcessingErrorsTotal.inc({
+    queue_name: queueName,
+    error_type: errorType,
+  })
+}
+
+/**
+ * Record queue blocked time
+ */
+export function recordQueueBlocked(
+  queueName: string,
+  blockedSeconds: number
+): void {
+  queueBlockedSeconds.set({ queue_name: queueName }, blockedSeconds)
 }
 
 /**
