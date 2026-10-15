@@ -54,7 +54,10 @@ export interface ConsentValidationResult {
 }
 
 /** Mapping of high-risk workflows to their mandatory consent scope */
-export const WORKFLOW_CONSENT_REQUIREMENTS: Record<HighRiskWorkflow, ConsentScope> = {
+export const WORKFLOW_CONSENT_REQUIREMENTS: Record<
+  HighRiskWorkflow,
+  ConsentScope
+> = {
   AUTOMATED_TRADING: 'consent:automated_trading',
   PROFILE_ANALYTICS: 'consent:data_processing',
   THIRD_PARTY_EXPORT: 'consent:third_party_sharing',
@@ -70,7 +73,14 @@ export const WORKFLOW_CONSENT_REQUIREMENTS: Record<HighRiskWorkflow, ConsentScop
 export function validateWorkflowConsent(
   opts: ConsentValidationOptions
 ): ConsentValidationResult {
-  const { userId, workflow, requiredScope, userConsents, bypassReason, bypassJustification } = opts
+  const {
+    userId,
+    workflow,
+    requiredScope,
+    userConsents,
+    bypassReason,
+    bypassJustification,
+  } = opts
 
   // Check for documented, auditable bypass
   if (bypassReason) {
@@ -84,14 +94,17 @@ export function validateWorkflowConsent(
       }
     }
 
-    logger.warn('[Consent Policy Audit] High-risk workflow executed under auditable consent bypass:', {
-      userId,
-      workflow,
-      requiredScope,
-      bypassReason,
-      bypassJustification,
-      timestamp: new Date().toISOString(),
-    })
+    logger.warn(
+      '[Consent Policy Audit] High-risk workflow executed under auditable consent bypass:',
+      {
+        userId,
+        workflow,
+        requiredScope,
+        bypassReason,
+        bypassJustification,
+        timestamp: new Date().toISOString(),
+      }
+    )
 
     return {
       allowed: true,
@@ -103,7 +116,9 @@ export function validateWorkflowConsent(
   }
 
   // Validate user consent status
-  const hasConsent = Boolean(userConsents && userConsents[requiredScope] === true)
+  const hasConsent = Boolean(
+    userConsents && userConsents[requiredScope] === true
+  )
 
   if (!hasConsent) {
     logger.info('[Consent Policy] Workflow consent validation failed:', {

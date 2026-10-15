@@ -10,6 +10,7 @@ import { config } from '../config/env'
 import { publishUserEvent } from '../events/publisher'
 import { EVENT_TYPE_TOPIC } from '../events/types'
 import { sendWhatsAppMessage } from '../utils/twilio-client'
+import { messageDeliveryService } from '../messaging'
 import { formatAlertTriggeredReply } from '../whatsapp/formatters'
 import { sendPushNotification } from '../controllers/push-controller'
 import {
@@ -235,7 +236,13 @@ async function deliverAlert(
         threshold,
         observedValue,
       })
-      await sendWhatsAppMessage({ to: `whatsapp:${user.phone}`, body })
+      await messageDeliveryService.send({
+        channel: 'WHATSAPP',
+        recipient: user.phone,
+        userId: rule.userId,
+        category: 'ALERT',
+        body,
+      })
     }
   }
 
@@ -243,9 +250,12 @@ async function deliverAlert(
     const title = `Alert: ${rule.metric}`
     const body = `${rule.metric} is ${observedValue} (threshold: ${threshold})`
     await sendPushNotification(rule.userId, title, body, data).catch((err) => {
-      logger.warn(`[AlertRules] Failed to send push notification for rule ${rule.id}`, {
-        error: err instanceof Error ? err.message : String(err),
-      })
+      logger.warn(
+        `[AlertRules] Failed to send push notification for rule ${rule.id}`,
+        {
+          error: err instanceof Error ? err.message : String(err),
+        }
+      )
     })
   }
 }

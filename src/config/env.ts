@@ -96,7 +96,10 @@ function validateAllRequiredEnvVars(): void {
 
   // ── 1. Missing vars ──────────────────────────────────────────────────────
   for (const key of requiredVars) {
-    if (!process.env[key] && !(process.env.SECRET_BACKEND === 'aws-ssm' && ssmManagedSecrets.has(key))) {
+    if (
+      !process.env[key] &&
+      !(process.env.SECRET_BACKEND === 'aws-ssm' && ssmManagedSecrets.has(key))
+    ) {
       errors.push(`Missing required environment variable: ${key}`)
     }
   }
@@ -519,6 +522,23 @@ export const config = {
     twilioToken: process.env.TWILIO_AUTH_TOKEN || '',
     fromNumber: process.env.WHATSAPP_FROM || '',
   },
+  telegram: {
+    botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || '',
+    apiUrl: process.env.TELEGRAM_API_URL || 'https://api.telegram.org',
+  },
+  messaging: {
+    maxRetries: parseInt(process.env.MESSAGING_MAX_RETRIES || '3'),
+    baseDelayMs: parseInt(process.env.MESSAGING_BASE_DELAY_MS || '1000'),
+    maxDelayMs: parseInt(process.env.MESSAGING_MAX_DELAY_MS || '30000'),
+    retryIntervalMs: parseInt(
+      process.env.MESSAGING_RETRY_INTERVAL_MS || '60000'
+    ),
+    fallbackEnabled: process.env.MESSAGING_FALLBACK_ENABLED !== 'false',
+    dlqAlertThreshold: parseInt(
+      process.env.MESSAGING_DLQ_ALERT_THRESHOLD || '5'
+    ),
+  },
   transcription: {
     provider: process.env.TRANSCRIPTION_PROVIDER || 'openai',
     /**
@@ -845,7 +865,8 @@ export const config = {
     ),
     /** Minimum hold duration (ms) before a position is eligible for coverage. */
     minHoldDurationMs: parseInt(
-      process.env.PROTECTION_FUND_MIN_HOLD_DURATION_MS || String(7 * 24 * 60 * 60 * 1000)
+      process.env.PROTECTION_FUND_MIN_HOLD_DURATION_MS ||
+        String(7 * 24 * 60 * 60 * 1000)
     ),
     /** Default asset symbol for the fund. */
     defaultAssetSymbol: process.env.PROTECTION_FUND_DEFAULT_ASSET || 'USDC',

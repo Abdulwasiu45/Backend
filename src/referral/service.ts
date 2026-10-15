@@ -1089,7 +1089,14 @@ export async function referralLeaderboard(
   page: number = 1,
   limit: number = 20,
   includeDisplayName: boolean = false
-): Promise<{ ownerId: string; code: string; conversions: number; displayName?: string | null }[]> {
+): Promise<
+  {
+    ownerId: string
+    code: string
+    conversions: number
+    displayName?: string | null
+  }[]
+> {
   const codes = await db.referralCode.findMany({
     include: {
       owner: includeDisplayName
@@ -1116,7 +1123,8 @@ export async function referralLeaderboard(
     ownerId: c.ownerUserId,
     code: c.code,
     conversions: c._count.conversions,
-    ...(includeDisplayName ? { displayName: (c as any).owner?.displayName ?? null } : {}),
+    ...(includeDisplayName
+      ? { displayName: (c as any).owner?.displayName ?? null }
+      : {}),
   }))
 }
-

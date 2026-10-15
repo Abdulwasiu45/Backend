@@ -120,7 +120,9 @@ export async function sendPushNotification(
     })
 
     if (activeTokens.length === 0) {
-      logger.info(`No active push tokens for user ${userId}, skipping push notification`)
+      logger.info(
+        `No active push tokens for user ${userId}, skipping push notification`
+      )
       return
     }
 
@@ -138,7 +140,10 @@ export async function sendPushNotification(
           error: result.error,
         })
 
-        if (result.error?.includes('InvalidRegistration') || result.error?.includes('Unregistered')) {
+        if (
+          result.error?.includes('InvalidRegistration') ||
+          result.error?.includes('Unregistered')
+        ) {
           await db.pushDeviceToken.update({
             where: { id: deviceToken.id },
             data: { isActive: false },

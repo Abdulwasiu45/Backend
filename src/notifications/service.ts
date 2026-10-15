@@ -5,7 +5,10 @@
 
 import db from '../db'
 import { logger } from '../utils/logger'
-import { generateCorrelationId, runWithCorrelationIdAsync } from '../utils/correlation'
+import {
+  generateCorrelationId,
+  runWithCorrelationIdAsync,
+} from '../utils/correlation'
 import {
   NotificationChannel,
   NotificationCategory,
@@ -263,10 +266,7 @@ function simpleHash(str: string): string {
 /**
  * Verify unsubscribe token
  */
-export function verifyUnsubscribeToken(
-  token: string,
-  userId: string
-): boolean {
+export function verifyUnsubscribeToken(token: string, userId: string): boolean {
   try {
     const [hash, timestamp] = token.split(':')
 
@@ -321,13 +321,9 @@ export async function processUnsubscribe(
 
     // Disable preferences
     for (const category of categories) {
-      await setPreference(
-        request.userId,
-        request.channel,
-        category,
-        false,
-        { updatedBy: 'user' }
-      )
+      await setPreference(request.userId, request.channel, category, false, {
+        updatedBy: 'user',
+      })
 
       // Log unsubscribe action
       await logPreferenceChange({

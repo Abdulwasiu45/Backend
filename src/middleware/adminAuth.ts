@@ -49,6 +49,9 @@ export const ADMIN_SCOPES = [
   // #394 — GDPR/CCPA right-to-erasure
   'erasure:write',
   'erasure:read',
+  // #493 — Telegram and WhatsApp message delivery management & recovery
+  'messages:read',
+  'messages:write',
   // #528 — treasury sweep policies, emergency sweep, signer rotation.
   'treasury:read',
   'treasury:write',

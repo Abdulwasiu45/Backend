@@ -23,7 +23,13 @@ export interface TotpChallenge {
 
 export interface TotpChallengeResult {
   ok: true
-  user: { id: string; walletAddress: string; displayName: string | null; email: string | null; network: Network }
+  user: {
+    id: string
+    walletAddress: string
+    displayName: string | null
+    email: string | null
+    network: Network
+  }
   stellarPubKey: string
   network: Network
   referralCode?: string | null
@@ -148,7 +154,10 @@ export async function completeTotpChallenge(
     select: { secretEncrypted: true, verifiedAt: true },
   })
 
-  if (!credential?.verifiedAt || !verifyTotpCode(credential.secretEncrypted, code)) {
+  if (
+    !credential?.verifiedAt ||
+    !verifyTotpCode(credential.secretEncrypted, code)
+  ) {
     return { ok: false, reason: 'invalid_code' }
   }
 
@@ -156,7 +165,13 @@ export async function completeTotpChallenge(
 
   const user = await db.user.findUniqueOrThrow({
     where: { id: challenge.userId },
-    select: { id: true, walletAddress: true, displayName: true, email: true, network: true },
+    select: {
+      id: true,
+      walletAddress: true,
+      displayName: true,
+      email: true,
+      network: true,
+    },
   })
 
   logger.info('[TOTP] Challenge completed', { userId: challenge.userId })

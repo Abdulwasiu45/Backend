@@ -145,13 +145,11 @@ describe('MailRegistry failover (#496)', () => {
     const reject = new SesSignatureVerificationError('invalid_signature')
     ;(primary.parseWebhook as jest.Mock).mockRejectedValue(reject)
     const fallback = makeProvider('fallback')
-    fallback.parseWebhook = jest
-      .fn()
-      .mockResolvedValue({
-        type: 'delivery',
-        messageId: 'm-2',
-        recipient: 'u@e.co',
-      })
+    fallback.parseWebhook = jest.fn().mockResolvedValue({
+      type: 'delivery',
+      messageId: 'm-2',
+      recipient: 'u@e.co',
+    })
     const registry = new MailRegistry(primary, fallback)
 
     // A forged/tampered SES payload must never be rescued into processing by a

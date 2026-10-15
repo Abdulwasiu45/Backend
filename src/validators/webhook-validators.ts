@@ -53,6 +53,9 @@ const WEBHOOK_EVENTS = [
   'approval.executed',
   'approval.expired',
   'approval.cancelled',
+  // Lending events (#532)
+  'loan.liquidation_executed',
+  'loan.charged_off',
 ] as const
 
 export const createWebhookSchema = z.object({

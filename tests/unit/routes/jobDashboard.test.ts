@@ -4,14 +4,18 @@
 
 import fs from 'fs'
 import path from 'path'
-import { getJobDashboardSnapshot, recordJobCompletion, recordJobRetry } from '../../../src/utils/job-metrics'
+import {
+  getJobDashboardSnapshot,
+  recordJobCompletion,
+  recordJobRetry,
+} from '../../../src/utils/job-metrics'
 
 const ROOT = path.resolve(__dirname, '../../..')
 
 describe('Operational Job Dashboard & Telemetry (#509)', () => {
   it('records job retries and completion status in telemetry', async () => {
     const jobName = 'test_retention_sweep'
-    
+
     recordJobRetry(jobName)
     recordJobCompletion(jobName, 'success')
 
@@ -36,7 +40,10 @@ describe('Operational Job Dashboard & Telemetry (#509)', () => {
   })
 
   it('indexes JOB_TRIAGE_RUNBOOK.md in DOCUMENTATION_INDEX.md', () => {
-    const indexContent = fs.readFileSync(path.join(ROOT, 'docs', 'DOCUMENTATION_INDEX.md'), 'utf8')
+    const indexContent = fs.readFileSync(
+      path.join(ROOT, 'docs', 'DOCUMENTATION_INDEX.md'),
+      'utf8'
+    )
     expect(indexContent).toContain('JOB_TRIAGE_RUNBOOK.md')
   })
 })

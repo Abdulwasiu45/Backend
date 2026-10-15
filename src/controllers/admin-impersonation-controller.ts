@@ -24,7 +24,9 @@ export async function startImpersonation(
 
     const token = generateImpersonationToken(adminId, adminName, targetUserId)
 
-    logger.info(`[AdminImpersonation] Admin ${adminName} (${adminId}) started impersonating user ${targetUserId}`)
+    logger.info(
+      `[AdminImpersonation] Admin ${adminName} (${adminId}) started impersonating user ${targetUserId}`
+    )
 
     await publishUserEvent(
       targetUserId,

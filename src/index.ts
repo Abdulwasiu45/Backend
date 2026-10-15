@@ -65,6 +65,7 @@ import { scheduleProtocolRiskScoring } from './jobs/protocolRiskScoring'
 import { schedulePortfolioRiskJob } from './jobs/portfolioRisk'
 import { scheduleApprovalExpiry } from './jobs/approvalExpiry'
 import { scheduleReserveReconciliation } from './jobs/reserveReconciliation'
+import { scheduleMessageDeliverySweep } from './jobs/messageDeliverySweep'
 import { scheduleLoanAccrual } from './jobs/loanAccrual'
 import { scheduleLoanLiquidationMonitor } from './jobs/loanLiquidationMonitor'
 import { scheduleLinkedExternalWalletSync } from './jobs/linkedExternalWalletSync'
@@ -155,6 +156,7 @@ let outboxDispatcherHandle: NodeJS.Timeout | null = null
 let portfolioRiskJobHandle: NodeJS.Timeout | null = null
 let approvalExpiryHandle: NodeJS.Timeout | null = null
 let reserveReconciliationHandle: NodeJS.Timeout | null = null
+let messageDeliverySweepHandle: NodeJS.Timeout | null = null
 let outboundNotificationsHandle: NodeJS.Timeout | null = null
 let linkedExternalWalletSyncHandle: NodeJS.Timeout | null = null
 let loanAccrualHandle: NodeJS.Timeout | null = null
@@ -381,7 +383,10 @@ const apiRoutes: ApiRoute[] = [
   { path: 'strategies', handlers: [strategiesRouter] },
   { path: 'sub-accounts', handlers: [subAccountsRouter] },
   { path: 'support/tickets', handlers: [supportTicketsRouter] },
-  { path: 'admin/support/tickets', handlers: [adminRateLimiter, adminSupportTicketsRouter] },
+  {
+    path: 'admin/support/tickets',
+    handlers: [adminRateLimiter, adminSupportTicketsRouter],
+  },
   { path: 'assistant', handlers: [assistantRouter] },
   { path: 'approvals', handlers: [approvalsRouter] },
   { path: 'approval-policies', handlers: [approvalPoliciesRouter] },
@@ -390,7 +395,10 @@ const apiRoutes: ApiRoute[] = [
   { path: 'stream', handlers: [streamRouter] },
   { path: 'notifications', handlers: [notificationsRouter] },
   { path: 'liquidity-floor', handlers: [liquidityFloorRouter] },
-  { path: 'admin/notifications/dlq', handlers: [adminRateLimiter, notificationDlqRouter] },
+  {
+    path: 'admin/notifications/dlq',
+    handlers: [adminRateLimiter, notificationDlqRouter],
+  },
   { path: 'admin', handlers: [adminRateLimiter, adminRouter] },
 ]
 
@@ -526,6 +534,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
     logger.info('[Shutdown] Reserve reconciliation timer cleared')
   }
 
+  if (messageDeliverySweepHandle) {
+    clearInterval(messageDeliverySweepHandle)
+    messageDeliverySweepHandle = null
+    logger.info('[Shutdown] Message delivery sweep timer cleared')
+  }
+
   if (linkedExternalWalletSyncHandle) {
     clearInterval(linkedExternalWalletSyncHandle)
     linkedExternalWalletSyncHandle = null
@@ -608,7 +622,9 @@ async function initServices(): Promise<void> {
   const { validateSecretCredentials } = await import('./config/secrets')
   const secretErrors = validateSecretCredentials()
   if (secretErrors.length) {
-    throw new Error(`[Startup] Secret validation failed: ${secretErrors.join('; ')}`)
+    throw new Error(
+      `[Startup] Secret validation failed: ${secretErrors.join('; ')}`
+    )
   }
 
   if (config.nodeEnv === 'production') {
@@ -762,6 +778,7 @@ async function main(): Promise<void> {
   portfolioRiskJobHandle = schedulePortfolioRiskJob()
   approvalExpiryHandle = scheduleApprovalExpiry()
   reserveReconciliationHandle = scheduleReserveReconciliation()
+  messageDeliverySweepHandle = scheduleMessageDeliverySweep()
   outboundNotificationsHandle = scheduleOutboundNotifications()
   linkedExternalWalletSyncHandle = scheduleLinkedExternalWalletSync()
   // #532 — accrual first, then the monitor: the monitor values loans, and it

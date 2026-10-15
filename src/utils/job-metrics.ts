@@ -138,7 +138,8 @@ export async function getJobDashboardSnapshot(): Promise<{
     } else if (metric.name === 'job_completion_status') {
       for (const val of metric.values) {
         const job = (val.labels as any).job_name
-        if (job) getOrCreate(job).lastStatus = val.value === 1 ? 'success' : 'failed'
+        if (job)
+          getOrCreate(job).lastStatus = val.value === 1 ? 'success' : 'failed'
       }
     }
   }
@@ -148,4 +149,3 @@ export async function getJobDashboardSnapshot(): Promise<{
     jobs: jobMap,
   }
 }
-

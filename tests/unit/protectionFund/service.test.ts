@@ -86,7 +86,11 @@ describe('src/protectionFund/service', () => {
     })
 
     it('returns the balance for a known asset', async () => {
-      mockFindUnique.mockResolvedValue({ assetSymbol: 'USDC', amount: '50000', status: 'ACTIVE' })
+      mockFindUnique.mockResolvedValue({
+        assetSymbol: 'USDC',
+        amount: '50000',
+        status: 'ACTIVE',
+      })
       const balance = await getFundBalance('USDC')
       expect(balance.amount).toBe(50000)
       expect(balance.status).toBe('ACTIVE')
@@ -145,7 +149,10 @@ describe('src/protectionFund/service', () => {
 
   describe('reviewCoverageEvent', () => {
     it('approves and computes claims', async () => {
-      mockFindUnique.mockResolvedValue({ id: 'event-1', status: 'PENDING_REVIEW' })
+      mockFindUnique.mockResolvedValue({
+        id: 'event-1',
+        status: 'PENDING_REVIEW',
+      })
       mockUpdate.mockResolvedValue({ id: 'event-1', status: 'APPROVED' })
       mockFindMany.mockResolvedValue([])
 
@@ -157,16 +164,28 @@ describe('src/protectionFund/service', () => {
     it('rejects an event that is not pending', async () => {
       mockFindUnique.mockResolvedValue({ id: 'event-1', status: 'APPROVED' })
 
-      await expect(reviewCoverageEvent('event-1', true, 'admin-2')).rejects.toThrow('not pending review')
+      await expect(
+        reviewCoverageEvent('event-1', true, 'admin-2')
+      ).rejects.toThrow('not pending review')
     })
   })
 
   describe('getMyCoverage', () => {
     it('returns coverage info for a user', async () => {
       mockFindMany.mockResolvedValue([
-        { id: 'pos-1', protocolName: 'Blend', assetSymbol: 'USDC', currentValue: '5000', createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+        {
+          id: 'pos-1',
+          protocolName: 'Blend',
+          assetSymbol: 'USDC',
+          currentValue: '5000',
+          createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+        },
       ])
-      mockFindUnique.mockResolvedValue({ assetSymbol: 'USDC', amount: '50000', status: 'ACTIVE' })
+      mockFindUnique.mockResolvedValue({
+        assetSymbol: 'USDC',
+        amount: '50000',
+        status: 'ACTIVE',
+      })
 
       const coverage = await getMyCoverage('user-1')
 
@@ -178,10 +197,33 @@ describe('src/protectionFund/service', () => {
 
   describe('getProtectionFundStatus', () => {
     it('returns the public status', async () => {
-      mockFindUnique.mockResolvedValue({ assetSymbol: 'USDC', amount: '50000', status: 'ACTIVE' })
+      mockFindUnique.mockResolvedValue({
+        assetSymbol: 'USDC',
+        amount: '50000',
+        status: 'ACTIVE',
+      })
       mockFindMany
-        .mockResolvedValueOnce([{ id: 'c1', source: 'REVENUE_SKIM', assetSymbol: 'USDC', amount: '1000', createdAt: new Date() }])
-        .mockResolvedValueOnce([{ id: 'e1', protocolName: 'Blend', cause: 'EXPLOIT', status: 'APPROVED', totalPlatformExposure: '100000', lossWindowStart: '2026-09-01', lossWindowEnd: '2026-09-02', createdAt: new Date() }])
+        .mockResolvedValueOnce([
+          {
+            id: 'c1',
+            source: 'REVENUE_SKIM',
+            assetSymbol: 'USDC',
+            amount: '1000',
+            createdAt: new Date(),
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            id: 'e1',
+            protocolName: 'Blend',
+            cause: 'EXPLOIT',
+            status: 'APPROVED',
+            totalPlatformExposure: '100000',
+            lossWindowStart: '2026-09-01',
+            lossWindowEnd: '2026-09-02',
+            createdAt: new Date(),
+          },
+        ])
 
       const status = await getProtectionFundStatus()
 

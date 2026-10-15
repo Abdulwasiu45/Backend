@@ -350,8 +350,8 @@ async function rebalanceCheckJob(): Promise<void> {
         const hasStrategyContext =
           Boolean(lead.config.strategyName) ||
           Boolean(lead.follow) ||
-          (protocolPositions[0].user as any).liquidityFloor !== null &&
-          (protocolPositions[0].user as any).liquidityFloor !== undefined
+          ((protocolPositions[0].user as any).liquidityFloor !== null &&
+            (protocolPositions[0].user as any).liquidityFloor !== undefined)
 
         const userStrategyPreferences = hasStrategyContext
           ? protocolPositions.map((p: PositionWithUser) => {
@@ -376,9 +376,7 @@ async function rebalanceCheckJob(): Promise<void> {
                 (p.user as any).liquidityFloor === undefined
                   ? {}
                   : {
-                      liquidityFloorUsd: Number(
-                        (p.user as any).liquidityFloor
-                      ),
+                      liquidityFloorUsd: Number((p.user as any).liquidityFloor),
                     }),
                 followedStrategyId: follow?.followedStrategyId ?? undefined,
               }

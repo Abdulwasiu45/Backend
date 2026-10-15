@@ -49,3 +49,16 @@ To protect deliverability and prevent spam, email addresses must pass a double o
     2. The certificate is fetched and cached per URL under a 5-minute TTL (failed fetches are never cached, so SNS retries get a genuine attempt).
     3. The canonical string is rebuilt with the exact field set for the message `Type` (Notification vs SubscriptionConfirmation differ), and `crypto.verify` checks `Signature` with `SignatureVersion` (1 → SHA-1, 2 → SHA-256; absent defaults to 1).
   - A delivery that fails verification — tampered body, spoofed certificate host, or certificate fetch failure — is rejected as **unauthenticated (401)**, logged, counted in `mail_webhook_rejections_total{reason}`, and **never** processed. A body that is not an SNS envelope at all has no verifiable provenance and is likewise rejected. The controller maps a verified-but-unprocessable payload to 400 and unexpected failures to 500.
+
+---
+
+## Telegram & WhatsApp Message Delivery (#493)
+
+Telegram bot interactions and WhatsApp alert dispatches are managed by the unified resilient messaging delivery service (`src/messaging/service.ts`).
+Features include:
+- Message delivery lifecycle tracking (`PENDING`, `SENDING`, `DELIVERED`, `FAILED`, `DEAD_LETTER`).
+- Provider 429 rate limit backoff and jittered exponential retry.
+- Cross-channel fallback between Telegram and WhatsApp.
+- Dead letter alerting and safe manual recovery admin endpoints.
+
+For complete architectural details, see [MESSAGING_DELIVERY.md](./MESSAGING_DELIVERY.md).

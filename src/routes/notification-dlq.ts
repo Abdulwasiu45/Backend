@@ -1,8 +1,5 @@
 import { Router } from 'express'
-import {
-  requireAdminAuth,
-  requireAdminScope,
-} from '../middleware/adminAuth'
+import { requireAdminAuth, requireAdminScope } from '../middleware/adminAuth'
 import {
   listDeadOutboundNotifications,
   retryDeadOutboundNotification,
@@ -16,15 +13,15 @@ router.get(
   requireAdminAuth,
   requireAdminScope('dlq:read'),
   async (_req, res) => {
-  try {
-    const items = await listDeadOutboundNotifications()
-    res.status(200).json({ items, count: items.length })
-  } catch (error) {
-    logger.error('[Admin] Failed to inspect outbound notification DLQ', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    res.status(500).json({ error: 'Failed to inspect notification queue' })
-  }
+    try {
+      const items = await listDeadOutboundNotifications()
+      res.status(200).json({ items, count: items.length })
+    } catch (error) {
+      logger.error('[Admin] Failed to inspect outbound notification DLQ', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      res.status(500).json({ error: 'Failed to inspect notification queue' })
+    }
   }
 )
 

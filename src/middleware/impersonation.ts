@@ -5,7 +5,8 @@ import db from '../db'
 import { logger } from '../utils/logger'
 
 const IMPERSONATION_TTL_MINUTES = 30
-const IMPERSONATION_SECRET = process.env.IMPERSONATION_SECRET || 'impersonation-secret'
+const IMPERSONATION_SECRET =
+  process.env.IMPERSONATION_SECRET || 'impersonation-secret'
 
 export interface ImpersonationContext {
   adminId: string
@@ -26,7 +27,9 @@ export function generateImpersonationToken(
 ): string {
   const sessionId = crypto.randomUUID()
   const createdAt = new Date()
-  const expiresAt = new Date(createdAt.getTime() + IMPERSONATION_TTL_MINUTES * 60 * 1000)
+  const expiresAt = new Date(
+    createdAt.getTime() + IMPERSONATION_TTL_MINUTES * 60 * 1000
+  )
 
   const payload: ImpersonationContext = {
     adminId,
@@ -49,7 +52,10 @@ export function verifyImpersonationToken(
   token: string
 ): ImpersonationContext | null {
   try {
-    const decoded = jwt.verify(token, IMPERSONATION_SECRET) as ImpersonationContext
+    const decoded = jwt.verify(
+      token,
+      IMPERSONATION_SECRET
+    ) as ImpersonationContext
 
     if (new Date() > new Date(decoded.expiresAt)) {
       return null

@@ -47,11 +47,22 @@ const EXPECTED_DEFAULT_RPCS: Record<string, string> = {
 export function checkStellarIntegrationDrift(
   customConfig?: StellarDriftConfig
 ): DriftCheckReport {
-  const envNetwork = (customConfig?.network || process.env.STELLAR_NETWORK || 'testnet').toLowerCase()
-  const rpcUrl = customConfig?.rpcUrl || process.env.STELLAR_RPC_URL || process.env.STELLAR_RPC_URLS || ''
-  const vaultContractId = customConfig?.vaultContractId || process.env.VAULT_CONTRACT_ID || ''
-  const usdcTokenAddress = customConfig?.usdcTokenAddress || process.env.USDC_TOKEN_ADDRESS || ''
-  const agentSecretKey = customConfig?.agentSecretKey || process.env.STELLAR_AGENT_SECRET_KEY || ''
+  const envNetwork = (
+    customConfig?.network ||
+    process.env.STELLAR_NETWORK ||
+    'testnet'
+  ).toLowerCase()
+  const rpcUrl =
+    customConfig?.rpcUrl ||
+    process.env.STELLAR_RPC_URL ||
+    process.env.STELLAR_RPC_URLS ||
+    ''
+  const vaultContractId =
+    customConfig?.vaultContractId || process.env.VAULT_CONTRACT_ID || ''
+  const usdcTokenAddress =
+    customConfig?.usdcTokenAddress || process.env.USDC_TOKEN_ADDRESS || ''
+  const agentSecretKey =
+    customConfig?.agentSecretKey || process.env.STELLAR_AGENT_SECRET_KEY || ''
 
   const drifts: DriftIssue[] = []
   let checksPassed = 0
@@ -112,7 +123,10 @@ export function checkStellarIntegrationDrift(
     })
   } else {
     // Check for network mismatch in RPC URL
-    if (envNetwork === 'mainnet' && (rpcUrl.includes('testnet') || rpcUrl.includes('futurenet'))) {
+    if (
+      envNetwork === 'mainnet' &&
+      (rpcUrl.includes('testnet') || rpcUrl.includes('futurenet'))
+    ) {
       drifts.push({
         component: 'network',
         field: 'STELLAR_RPC_URL',
@@ -170,7 +184,10 @@ export function checkStellarIntegrationDrift(
       severity: 'error',
       description: 'USDC_TOKEN_ADDRESS is missing from deployment metadata',
     })
-  } else if (!isValidContractId(usdcTokenAddress) && !StrKey.isValidEd25519PublicKey(usdcTokenAddress)) {
+  } else if (
+    !isValidContractId(usdcTokenAddress) &&
+    !StrKey.isValidEd25519PublicKey(usdcTokenAddress)
+  ) {
     drifts.push({
       component: 'contract',
       field: 'USDC_TOKEN_ADDRESS',
@@ -192,7 +209,8 @@ export function checkStellarIntegrationDrift(
       expected: 'Valid Stellar Secret Key (56 chars starting with S)',
       actual: 'missing',
       severity: 'error',
-      description: 'STELLAR_AGENT_SECRET_KEY is missing from environment metadata',
+      description:
+        'STELLAR_AGENT_SECRET_KEY is missing from environment metadata',
     })
   } else if (!StrKey.isValidEd25519SecretSeed(agentSecretKey)) {
     drifts.push({
@@ -201,7 +219,8 @@ export function checkStellarIntegrationDrift(
       expected: 'Valid Stellar Secret Key (56 chars starting with S)',
       actual: 'invalid_secret_key_format',
       severity: 'error',
-      description: 'STELLAR_AGENT_SECRET_KEY fails Ed25519 secret seed validation',
+      description:
+        'STELLAR_AGENT_SECRET_KEY fails Ed25519 secret seed validation',
     })
   } else {
     checksPassed++
@@ -220,5 +239,7 @@ export function checkStellarIntegrationDrift(
 }
 
 function isValidContractId(id: string): boolean {
-  return Boolean(id && id.length === 56 && id.startsWith('C') && StrKey.isValidContract(id))
+  return Boolean(
+    id && id.length === 56 && id.startsWith('C') && StrKey.isValidContract(id)
+  )
 }

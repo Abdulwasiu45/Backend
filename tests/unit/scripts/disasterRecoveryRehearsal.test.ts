@@ -42,7 +42,10 @@ describe('Disaster Recovery Rehearsal & Backup Validation (#511)', () => {
   })
 
   it('is indexed in DOCUMENTATION_INDEX.md', () => {
-    const docIndex = fs.readFileSync(path.join(ROOT, 'docs', 'DOCUMENTATION_INDEX.md'), 'utf8')
+    const docIndex = fs.readFileSync(
+      path.join(ROOT, 'docs', 'DOCUMENTATION_INDEX.md'),
+      'utf8'
+    )
     expect(docIndex).toContain('DISASTER_RECOVERY_REHEARSAL.md')
   })
 })

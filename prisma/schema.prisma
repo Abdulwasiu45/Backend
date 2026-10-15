@@ -325,14 +325,6 @@ model User {
   isActive          Boolean          @default(true)
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
-  phone               String?          @unique
-  riskTolerance       Int              @default(5)
-  rebalanceStrategy   String? // 'MAX_YIELD' | 'TARGET_ALLOCATION' | null (defaults to MAX_YIELD)
-  strategyConfig      Json? // e.g. { "targetAllocations": { "Blend": 50, "Stellar DEX": 30, "Luma": 20 } }
-  taxAwareRebalancing Boolean          @default(false) // #550 - opt-in wash-sale-aware rebalancing
-  isActive            Boolean          @default(true)
-  createdAt           DateTime         @default(now())
-  updatedAt           DateTime         @updatedAt
   // #317 — cost-basis consumption method for the tax report. Changing this
   // is forward-only: methodEffectiveAt stamps when a change took effect, so
   // disposals recorded before it are never retroactively recomputed (see
@@ -2444,6 +2436,8 @@ model ProtocolLiquiditySnapshot {
   @@index([protocolName, assetSymbol])
   @@index([fetchedAt])
   @@map("protocol_liquidity_snapshots")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Treasury accounts (#jobs/treasurySweep.ts, #outbox/executors.ts)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2729,3 +2723,53 @@ model WebAuthnChallenge {
   @@map("webauthn_challenges")
 }
 
+// ── Telegram & WhatsApp Message Delivery (#493) ──────────────────────────
+
+enum MessageChannel {
+  TELEGRAM
+  WHATSAPP
+}
+
+enum MessageDeliveryStatus {
+  PENDING
+  SENDING
+  DELIVERED
+  FAILED
+  DEAD_LETTER
+}
+
+enum MessagePriority {
+  HIGH
+  NORMAL
+  LOW
+}
+
+model MessageDelivery {
+  id                String                @id @default(uuid())
+  channel           MessageChannel
+  recipient         String
+  userId            String?
+  category          String                @default("NOTIFICATION")
+  body              String
+  status            MessageDeliveryStatus @default(PENDING)
+  priority          MessagePriority       @default(NORMAL)
+  attempts          Int                   @default(0)
+  maxAttempts       Int                   @default(5)
+  nextAttemptAt     DateTime?
+  lastError         String?
+  providerMessageId String?
+  metadata          Json?
+  fallbackChannel   MessageChannel?
+  fallbackRecipient String?
+  fallbackTriggered Boolean               @default(false)
+  deliveredAt       DateTime?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  @@index([channel, status])
+  @@index([status, nextAttemptAt])
+  @@index([recipient])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("message_deliveries")
+}

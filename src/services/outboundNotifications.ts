@@ -6,14 +6,20 @@ import {
 } from '../utils/metrics'
 
 export type OutboundNotificationChannel =
-  | 'email'
-  | 'sms'
-  | 'whatsapp'
-  | 'telegram'
+  'email' | 'sms' | 'whatsapp' | 'telegram'
 
-const MAX_ATTEMPTS = Math.max(1, Number(process.env.NOTIFICATION_MAX_ATTEMPTS) || 8)
-const BASE_DELAY_MS = Math.max(100, Number(process.env.NOTIFICATION_BASE_DELAY_MS) || 1000)
-const MAX_DELAY_MS = Math.max(BASE_DELAY_MS, Number(process.env.NOTIFICATION_MAX_DELAY_MS) || 300000)
+const MAX_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.NOTIFICATION_MAX_ATTEMPTS) || 8
+)
+const BASE_DELAY_MS = Math.max(
+  100,
+  Number(process.env.NOTIFICATION_BASE_DELAY_MS) || 1000
+)
+const MAX_DELAY_MS = Math.max(
+  BASE_DELAY_MS,
+  Number(process.env.NOTIFICATION_MAX_DELAY_MS) || 300000
+)
 const BATCH_SIZE = 50
 
 type NotificationRecord = {
@@ -67,12 +73,17 @@ async function deliver(notification: NotificationRecord): Promise<string> {
           signal: AbortSignal.timeout(10_000),
         }
       )
-      if (!response.ok) throw new Error(`Telegram API returned HTTP ${response.status}`)
-      const result = (await response.json()) as { result?: { message_id?: number } }
+      if (!response.ok)
+        throw new Error(`Telegram API returned HTTP ${response.status}`)
+      const result = (await response.json()) as {
+        result?: { message_id?: number }
+      }
       return String(result.result?.message_id ?? 'accepted')
     }
   }
-  throw new Error(`Unsupported outbound notification channel: ${notification.channel}`)
+  throw new Error(
+    `Unsupported outbound notification channel: ${notification.channel}`
+  )
 }
 
 function retryDelayMs(attempt: number): number {
@@ -118,7 +129,10 @@ export async function dispatchOutboundNotifications(): Promise<void> {
         where: { id: notification.id },
         data: { status: 'DELIVERED', providerId, lastError: null },
       })
-      outboundNotificationAttempts.inc({ channel: notification.channel, status: 'delivered' })
+      outboundNotificationAttempts.inc({
+        channel: notification.channel,
+        status: 'delivered',
+      })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const dead = attempt >= MAX_ATTEMPTS
@@ -164,7 +178,9 @@ export async function listDeadOutboundNotifications(limit = 100) {
   })
 }
 
-export async function retryDeadOutboundNotification(id: string): Promise<boolean> {
+export async function retryDeadOutboundNotification(
+  id: string
+): Promise<boolean> {
   const result = await (db as any).outboundNotification.updateMany({
     where: { id, status: 'DEAD' },
     data: {

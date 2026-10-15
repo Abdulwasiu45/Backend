@@ -43,7 +43,9 @@ router.put(
         displayCurrency: updated.displayCurrency,
       })
     } catch (err) {
-      logger.error('[Settings] Update failed', { error: err instanceof Error ? err.message : String(err) })
+      logger.error('[Settings] Update failed', {
+        error: err instanceof Error ? err.message : String(err),
+      })
       return sendError(res, 500, 'Failed to update settings')
     }
   }

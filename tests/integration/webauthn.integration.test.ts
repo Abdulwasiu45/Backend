@@ -269,12 +269,10 @@ describe('passkey security and session integration', () => {
     mockChallenges.get(options.body.challengeId).sessionId = 'another-session'
     expect(
       (
-        await request(app)
-          .post('/api/v1/webauthn/register-verify')
-          .send({
-            challengeId: options.body.challengeId,
-            response: registration,
-          })
+        await request(app).post('/api/v1/webauthn/register-verify').send({
+          challengeId: options.body.challengeId,
+          response: registration,
+        })
       ).status
     ).toBe(400)
     expect(verifyRegistrationResponse).not.toHaveBeenCalled()

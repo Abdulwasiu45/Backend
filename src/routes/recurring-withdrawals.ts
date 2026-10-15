@@ -303,12 +303,10 @@ router.patch(
       (amountMode === 'PERCENT_OF_BALANCE' &&
         Number(updates.percentage ?? existing.percentage) <= 0)
     ) {
-      res
-        .status(400)
-        .json({
-          error:
-            'The selected amount mode requires a positive amount or percentage',
-        })
+      res.status(400).json({
+        error:
+          'The selected amount mode requires a positive amount or percentage',
+      })
       return
     }
     if (existing.lastRunStatus === 'executing') {

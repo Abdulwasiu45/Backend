@@ -23,7 +23,11 @@ import {
   rotateRefreshToken,
   type RefreshFailureReason,
 } from '../services/refresh-token.service'
-import { getActiveTotpCredential, issueTotpChallenge, completeTotpChallenge } from '../services/totp.service'
+import {
+  getActiveTotpCredential,
+  issueTotpChallenge,
+  completeTotpChallenge,
+} from '../services/totp.service'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -251,7 +255,10 @@ export async function verifyTotp(req: Request, res: Response): Promise<void> {
     code?: unknown
   }
 
-  if (typeof totpChallengeToken !== 'string' || totpChallengeToken.length === 0) {
+  if (
+    typeof totpChallengeToken !== 'string' ||
+    totpChallengeToken.length === 0
+  ) {
     res.status(400).json({ error: 'totpChallengeToken is required' })
     return
   }

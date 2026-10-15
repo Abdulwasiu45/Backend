@@ -42,14 +42,16 @@ export const OPTIONAL_SECRET_KEYS = [
 export type SecretKey = (typeof SECRET_KEYS)[number]
 export type OptionalSecretKey = (typeof OPTIONAL_SECRET_KEYS)[number]
 
-const secretValidators: Partial<Record<SecretKey, (value: string) => boolean>> = {
-  JWT_SEED: (value) => value.length >= 32,
-  WALLET_ENCRYPTION_KEY: (value) => /^[0-9a-f]{64}$/i.test(value),
-  STELLAR_AGENT_SECRET_KEY: (value) => value.startsWith('S') && value.length === 56,
-  ANTHROPIC_API_KEY: (value) => value.startsWith('sk-ant-'),
-  TWILIO_AUTH_TOKEN: (value) => value.length >= 32,
-  DATABASE_URL: (value) => /^postgres(?:ql)?:\/\//.test(value),
-}
+const secretValidators: Partial<Record<SecretKey, (value: string) => boolean>> =
+  {
+    JWT_SEED: (value) => value.length >= 32,
+    WALLET_ENCRYPTION_KEY: (value) => /^[0-9a-f]{64}$/i.test(value),
+    STELLAR_AGENT_SECRET_KEY: (value) =>
+      value.startsWith('S') && value.length === 56,
+    ANTHROPIC_API_KEY: (value) => value.startsWith('sk-ant-'),
+    TWILIO_AUTH_TOKEN: (value) => value.length >= 32,
+    DATABASE_URL: (value) => /^postgres(?:ql)?:\/\//.test(value),
+  }
 
 const optionalSecretValidators: Partial<
   Record<OptionalSecretKey, (value: string) => boolean>
@@ -67,7 +69,8 @@ export function validateSecretCredentials(now = new Date()): string[] {
       errors.push(`${key} is missing`)
       continue
     }
-    if (!secretValidators[key]?.(value)) errors.push(`${key} has an invalid format`)
+    if (!secretValidators[key]?.(value))
+      errors.push(`${key} has an invalid format`)
 
     const expiresAt = process.env[`SECRET_EXPIRY_${key}`]
     if (expiresAt) {
@@ -80,7 +83,11 @@ export function validateSecretCredentials(now = new Date()): string[] {
 
   for (const key of OPTIONAL_SECRET_KEYS) {
     const value = process.env[key]
-    if (value && optionalSecretValidators[key] && !optionalSecretValidators[key]!(value)) {
+    if (
+      value &&
+      optionalSecretValidators[key] &&
+      !optionalSecretValidators[key]!(value)
+    ) {
       errors.push(`${key} has an invalid format`)
     }
     const expiresAt = process.env[`SECRET_EXPIRY_${key}`]

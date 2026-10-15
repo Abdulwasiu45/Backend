@@ -38,6 +38,21 @@ export type ApprovalPayload =
       selectedLotIds?: string[]
       acknowledgeGoalImpact?: boolean
     }
+  | {
+      type: 'loan_origination'
+      userId: string
+      positionId: string
+      principal: number
+      borrowedAsset: string
+      actingAsUserId?: string | null
+    }
+  | {
+      type: 'loan_repayment'
+      userId: string
+      loanId: string
+      amount: number
+      actingAsUserId?: string | null
+    }
 
 /**
  * Re-run an approved payload through the exact same deposit/withdraw path a
@@ -50,9 +65,32 @@ export type ApprovalPayload =
 export async function runApprovedPayload(
   requestId: string,
   payload: ApprovalPayload
-): Promise<ExecuteDepositResult | ExecuteWithdrawResult> {
+): Promise<ExecuteDepositResult | ExecuteWithdrawResult | any> {
   const { executeDeposit, executeWithdraw } =
     await import('../controllers/transaction-controller')
+
+  if (payload.type === 'loan_origination') {
+    const { originateLoan } = await import('../lending/service')
+    return originateLoan({
+      userId: payload.userId,
+      positionId: payload.positionId,
+      principal: payload.principal,
+      borrowedAsset: payload.borrowedAsset,
+      actingAsUserId: payload.actingAsUserId,
+      skipApprovalGuard: true,
+    })
+  }
+
+  if (payload.type === 'loan_repayment') {
+    const { repayLoan } = await import('../lending/service')
+    return repayLoan({
+      userId: payload.userId,
+      loanId: payload.loanId,
+      amount: payload.amount,
+      actingAsUserId: payload.actingAsUserId,
+      skipApprovalGuard: true,
+    })
+  }
 
   const memo = payload.memo
     ? `${payload.memo} (approval:${requestId})`

@@ -101,11 +101,9 @@ router.post(
     const { operations, atomic } = bulkSubAccountsSchema.parse(req.body)
     const parentUserId = req.auth!.userId
     if (operations.length > MAX_BULK_BATCH_SIZE) {
-      res
-        .status(400)
-        .json({
-          error: `Batch size exceeds maximum limit of ${MAX_BULK_BATCH_SIZE} operations`,
-        })
+      res.status(400).json({
+        error: `Batch size exceeds maximum limit of ${MAX_BULK_BATCH_SIZE} operations`,
+      })
       return
     }
     const errorText = (err: unknown) =>
@@ -140,24 +138,22 @@ router.post(
           audit(parentUserId, result.action, result.data)
         res.json({ atomic: true, results })
       } catch (err) {
-        res
-          .status(400)
-          .json({
-            atomic: true,
-            rolledBack: true,
-            failedIndex,
-            error: 'Atomic batch failed; transaction rolled back',
-            message: errorText(err),
-            results: operations.map((_, index) => ({
-              index,
-              success: false,
-              ...(index === failedIndex
-                ? { error: errorText(err) }
-                : index < failedIndex
-                  ? { rolledBack: true }
-                  : { skipped: true }),
-            })),
-          })
+        res.status(400).json({
+          atomic: true,
+          rolledBack: true,
+          failedIndex,
+          error: 'Atomic batch failed; transaction rolled back',
+          message: errorText(err),
+          results: operations.map((_, index) => ({
+            index,
+            success: false,
+            ...(index === failedIndex
+              ? { error: errorText(err) }
+              : index < failedIndex
+                ? { rolledBack: true }
+                : { skipped: true }),
+          })),
+        })
       }
       return
     }

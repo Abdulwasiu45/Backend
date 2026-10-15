@@ -31,16 +31,19 @@ export interface XeroTransaction {
  * Convert transactions to Xero-compatible bank statement CSV format.
  * Xero expects specific column headers for bank statement imports.
  */
-export function toXeroCsv(transactions: Array<{
-  type: TransactionType
-  amount: string
-  assetSymbol: string
-  fee?: string | null
-  createdAt: Date
-  protocolName?: string | null
-}>): string {
+export function toXeroCsv(
+  transactions: Array<{
+    type: TransactionType
+    amount: string
+    assetSymbol: string
+    fee?: string | null
+    createdAt: Date
+    protocolName?: string | null
+  }>
+): string {
   const xeroTransactions: XeroTransaction[] = transactions.map((tx) => {
-    const category = TRANSACTION_TYPE_TO_XERO_CATEGORY[tx.type] || 'Uncategorized'
+    const category =
+      TRANSACTION_TYPE_TO_XERO_CATEGORY[tx.type] || 'Uncategorized'
     const amount = Number(tx.amount)
     const fee = tx.fee ? Number(tx.fee) : 0
     const netAmount = amount - fee
@@ -60,7 +63,14 @@ export function toXeroCsv(transactions: Array<{
     }
   })
 
-  const headers = ['Date', 'Amount', 'Payee', 'Description', 'Reference', 'Category']
+  const headers = [
+    'Date',
+    'Amount',
+    'Payee',
+    'Description',
+    'Reference',
+    'Category',
+  ]
   const rows = xeroTransactions.map((tx) => [
     tx.date,
     tx.amount,

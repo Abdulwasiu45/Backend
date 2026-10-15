@@ -27,9 +27,12 @@ export function requireConsentPolicy(
   return (req: ConsentRequest, res: Response, next: NextFunction): void => {
     const userId = (req as any).user?.id || (req as any).userId || 'anonymous'
     const userConsents = req.userConsents || (req as any).user?.consents || {}
-    
-    const bypassReasonHeader = req.headers['x-consent-bypass-reason'] as AuditableBypassReason | undefined
-    const bypassJustificationHeader = req.headers['x-consent-bypass-justification'] as string | undefined
+
+    const bypassReasonHeader = req.headers['x-consent-bypass-reason'] as
+      AuditableBypassReason | undefined
+    const bypassJustificationHeader = req.headers[
+      'x-consent-bypass-justification'
+    ] as string | undefined
 
     const validation = validateWorkflowConsent({
       userId,

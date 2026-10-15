@@ -70,13 +70,16 @@ export async function getFundBalance(assetSymbol?: string) {
   }
 }
 
-export async function recordContribution(input: {
-  source: string
-  assetSymbol: string
-  amount: number
-  sourceRef?: string
-  createdBy?: string
-}, database: Db = db) {
+export async function recordContribution(
+  input: {
+    source: string
+    assetSymbol: string
+    amount: number
+    sourceRef?: string
+    createdBy?: string
+  },
+  database: Db = db
+) {
   const contribution = await database.protectionFundContribution.create({
     data: {
       source: input.source,
@@ -106,7 +109,13 @@ export async function recordContribution(input: {
     payloadHash: 'sha256:0',
     blockType: 'ADMIN_BATCH',
     createdAt: new Date(),
-    payloads: [{ type: 'PROTECTION_FUND_CONTRIBUTION', contributionId: contribution.id, amount: input.amount }],
+    payloads: [
+      {
+        type: 'PROTECTION_FUND_CONTRIBUTION',
+        contributionId: contribution.id,
+        amount: input.amount,
+      },
+    ],
   })
 
   return contribution
@@ -118,7 +127,9 @@ export async function declareCoverageEvent(input: DeclareEventInput) {
   const terms = getCoverageTerms()
 
   if (!terms.coveredCauses.includes(input.cause)) {
-    throw new Error(`Cause "${input.cause}" is not a covered event type. Covered: ${terms.coveredCauses.join(', ')}`)
+    throw new Error(
+      `Cause "${input.cause}" is not a covered event type. Covered: ${terms.coveredCauses.join(', ')}`
+    )
   }
 
   const event = await db.coverageEvent.create({
@@ -141,16 +152,27 @@ export async function declareCoverageEvent(input: DeclareEventInput) {
     payloadHash: 'sha256:0',
     blockType: 'ADMIN_BATCH',
     createdAt: new Date(),
-    payloads: [{ type: 'COVERAGE_EVENT_DECLARED', eventId: event.id, protocol: input.protocolName }],
+    payloads: [
+      {
+        type: 'COVERAGE_EVENT_DECLARED',
+        eventId: event.id,
+        protocol: input.protocolName,
+      },
+    ],
   })
 
   return event
 }
 
-export async function reviewCoverageEvent(eventId: string, approved: boolean, reviewedBy: string) {
+export async function reviewCoverageEvent(
+  eventId: string,
+  approved: boolean,
+  reviewedBy: string
+) {
   const event = await db.coverageEvent.findUnique({ where: { id: eventId } })
   if (!event) throw new Error('Coverage event not found')
-  if (event.status !== 'PENDING_REVIEW') throw new Error(`Event is not pending review (status: ${event.status})`)
+  if (event.status !== 'PENDING_REVIEW')
+    throw new Error(`Event is not pending review (status: ${event.status})`)
 
   const updated = await db.coverageEvent.update({
     where: { id: eventId },
@@ -199,7 +221,12 @@ export async function computeClaimsForEvent(eventId: string) {
     const netLoss = loss
     const cappedLoss = Math.min(netLoss, terms.perUserCoverageCap)
     const payoutAmount = Math.min(cappedLoss, remainingFund)
-    const coverageType = payoutAmount >= cappedLoss ? 'FULL' : payoutAmount > 0 ? 'PRORATED' : 'ZERO'
+    const coverageType =
+      payoutAmount >= cappedLoss
+        ? 'FULL'
+        : payoutAmount > 0
+          ? 'PRORATED'
+          : 'ZERO'
 
     const claim = await db.coverageClaim.create({
       data: {
@@ -229,17 +256,21 @@ export async function computeClaimsForEvent(eventId: string) {
     if (remainingFund <= 0) break
   }
 
-  logger.info(`[ProtectionFund] Computed ${claims.length} claims for event ${eventId}`)
+  logger.info(
+    `[ProtectionFund] Computed ${claims.length} claims for event ${eventId}`
+  )
   return claims
 }
 
-function computePositionLoss(position: any, lossStart: Date, lossEnd: Date): number {
-  const relevantTxs = position.transactions.filter(
-    (tx: any) => {
-      const txDate = new Date(tx.createdAt)
-      return txDate >= lossStart && txDate <= lossEnd
-    }
-  )
+function computePositionLoss(
+  position: any,
+  lossStart: Date,
+  lossEnd: Date
+): number {
+  const relevantTxs = position.transactions.filter((tx: any) => {
+    const txDate = new Date(tx.createdAt)
+    return txDate >= lossStart && txDate <= lossEnd
+  })
 
   let totalDeposited = 0
   let totalWithdrawn = 0
@@ -266,7 +297,8 @@ export async function executePayout(claimId: string) {
     include: { event: true },
   })
   if (!claim) throw new Error('Claim not found')
-  if (claim.status !== 'PENDING') throw new Error(`Claim is not pending (status: ${claim.status})`)
+  if (claim.status !== 'PENDING')
+    throw new Error(`Claim is not pending (status: ${claim.status})`)
   if (claim.payoutAmount.lte(0)) throw new Error('Claim has zero payout')
 
   const outboxOp = await enqueueOutboxOp(db, {
@@ -301,7 +333,13 @@ export async function executePayout(claimId: string) {
     payloadHash: 'sha256:0',
     blockType: 'TXN_BATCH',
     createdAt: new Date(),
-    payloads: [{ type: 'PROTECTION_FUND_PAYOUT', claimId, amount: Number(claim.payoutAmount) }],
+    payloads: [
+      {
+        type: 'PROTECTION_FUND_PAYOUT',
+        claimId,
+        amount: Number(claim.payoutAmount),
+      },
+    ],
   })
 
   return outboxOp
@@ -348,7 +386,10 @@ export async function getMyCoverage(userId: string) {
     coverageTerms: terms,
     estimatedCoverage: exposure
       .filter((e) => e.eligibleForCoverage)
-      .reduce((sum, e) => sum + Math.min(e.currentValue, terms.perUserCoverageCap), 0),
+      .reduce(
+        (sum, e) => sum + Math.min(e.currentValue, terms.perUserCoverageCap),
+        0
+      ),
   }
 }
 

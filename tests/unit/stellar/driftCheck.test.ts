@@ -8,7 +8,9 @@ import { checkStellarIntegrationDrift } from '../../../src/stellar/driftCheck'
 describe('Stellar Contract & Schema Drift Detection Engine (#508)', () => {
   const validContractId = StrKey.encodeContract(Buffer.alloc(32, 1))
   const validUsdcTokenAddress = StrKey.encodeContract(Buffer.alloc(32, 2))
-  const validAgentSecretKey = StrKey.encodeEd25519SecretSeed(Buffer.alloc(32, 3))
+  const validAgentSecretKey = StrKey.encodeEd25519SecretSeed(
+    Buffer.alloc(32, 3)
+  )
 
   it('passes validation when network, contract IDs, and RPC URLs are aligned', () => {
     const report = checkStellarIntegrationDrift({

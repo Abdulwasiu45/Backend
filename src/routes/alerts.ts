@@ -140,7 +140,7 @@ router.get(
       sortOrder: 'asc' | 'desc'
     }
 
-    const where: any = { userId }
+    const where: any = { userId, deletedAt: null }
     if (query.isActive !== undefined) where.isActive = query.isActive === 'true'
     if (query.metric) where.metric = query.metric
     if (query.protocolName) where.protocolName = query.protocolName
@@ -155,11 +155,6 @@ router.get(
         take: limit,
       }),
     ])
-    const rules = await (db as any).alertRule.findMany({
-      where: { userId, deletedAt: null },
-      select: alertSelect,
-      orderBy: { createdAt: 'desc' },
-    })
 
     return res
       .status(200)

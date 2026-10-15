@@ -154,13 +154,11 @@ describe('Support Ticket Integration Tests', () => {
 
   it('enforces internal visibility in both user-facing database read queries', async () => {
     const app = buildApp()
-    const created = await request(app)
-      .post('/api/v1/support/tickets')
-      .send({
-        subject: 'Private notes',
-        category: 'OTHER',
-        body: 'Please help with this issue',
-      })
+    const created = await request(app).post('/api/v1/support/tickets').send({
+      subject: 'Private notes',
+      category: 'OTHER',
+      body: 'Please help with this issue',
+    })
     await request(app).get('/api/v1/support/tickets')
     expect(db.supportTicket.findMany).toHaveBeenLastCalledWith(
       expect.objectContaining({
@@ -180,13 +178,11 @@ describe('Support Ticket Integration Tests', () => {
 
   it('rejects reads and replies for another owner', async () => {
     const app = buildApp()
-    const created = await request(app)
-      .post('/api/v1/support/tickets')
-      .send({
-        subject: 'Ownership test',
-        category: 'OTHER',
-        body: 'Please help with this issue',
-      })
+    const created = await request(app).post('/api/v1/support/tickets').send({
+      subject: 'Ownership test',
+      category: 'OTHER',
+      body: 'Please help with this issue',
+    })
     tickets.get(created.body.ticket.id).userId = 'another-user'
     expect(
       (
@@ -206,14 +202,12 @@ describe('Support Ticket Integration Tests', () => {
 
   it('computes urgent SLA breaches and excludes closed tickets', async () => {
     const app = buildApp()
-    const created = await request(app)
-      .post('/api/v1/support/tickets')
-      .send({
-        subject: 'Urgent test',
-        category: 'OTHER',
-        priority: 'URGENT',
-        body: 'Please help with this issue',
-      })
+    const created = await request(app).post('/api/v1/support/tickets').send({
+      subject: 'Urgent test',
+      category: 'OTHER',
+      priority: 'URGENT',
+      body: 'Please help with this issue',
+    })
     tickets.get(created.body.ticket.id).createdAt = new Date(
       Date.now() - 3 * 3600000
     )

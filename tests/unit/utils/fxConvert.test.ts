@@ -75,7 +75,10 @@ describe('src/utils/fxConvert', () => {
     })
 
     it('preserves all original fields', () => {
-      const result = withDisplayCurrency({ amountUsd: 100, name: 'test', id: '1' }, 'GBP')
+      const result = withDisplayCurrency(
+        { amountUsd: 100, name: 'test', id: '1' },
+        'GBP'
+      )
       expect(result.name).toBe('test')
       expect(result.id).toBe('1')
       expect(result.amountUsd).toBe(100)

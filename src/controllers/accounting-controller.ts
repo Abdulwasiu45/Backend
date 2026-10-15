@@ -12,7 +12,13 @@ const accountingExportSchema = z.object({
 export async function exportAccountingData(
   userId: string,
   query: unknown
-): Promise<{ success: boolean; data?: string; contentType?: string; filename?: string; error?: string }> {
+): Promise<{
+  success: boolean
+  data?: string
+  contentType?: string
+  filename?: string
+  error?: string
+}> {
   try {
     const parsed = accountingExportSchema.parse(query)
 
@@ -47,7 +53,9 @@ export async function exportAccountingData(
     }))
 
     if (transactions.length === 0) {
-      logger.info(`No transactions found for user ${userId} in the specified date range`)
+      logger.info(
+        `No transactions found for user ${userId} in the specified date range`
+      )
     }
 
     let data: string

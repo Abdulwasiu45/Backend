@@ -49,9 +49,12 @@ export class FcmPushProvider implements PushProvider {
 
     try {
       const messageId = `push_fcm_${Date.now()}`
-      logger.info(`[FcmPushProvider] Sent push via FCM to ${message.deviceToken}`, {
-        messageId,
-      })
+      logger.info(
+        `[FcmPushProvider] Sent push via FCM to ${message.deviceToken}`,
+        {
+          messageId,
+        }
+      )
 
       return { messageId, provider: this.name, success: true }
     } catch (err) {
@@ -83,9 +86,12 @@ export class ApnsPushProvider implements PushProvider {
 
     try {
       const messageId = `push_apns_${Date.now()}`
-      logger.info(`[ApnsPushProvider] Sent push via APNs to ${message.deviceToken}`, {
-        messageId,
-      })
+      logger.info(
+        `[ApnsPushProvider] Sent push via APNs to ${message.deviceToken}`,
+        {
+          messageId,
+        }
+      )
 
       return { messageId, provider: this.name, success: true }
     } catch (err) {
@@ -126,16 +132,15 @@ export class PushRegistry {
   getProvider(platform: string): PushProvider {
     const provider = this.providers.get(platform.toLowerCase())
     if (!provider) {
-      logger.warn(`[PushRegistry] No provider for platform "${platform}", falling back to mock`)
+      logger.warn(
+        `[PushRegistry] No provider for platform "${platform}", falling back to mock`
+      )
       return this.providers.get('mock')!
     }
     return provider
   }
 
-  async send(
-    platform: string,
-    message: PushMessage
-  ): Promise<PushSendResult> {
+  async send(platform: string, message: PushMessage): Promise<PushSendResult> {
     const provider = this.getProvider(platform)
     return provider.send(message)
   }

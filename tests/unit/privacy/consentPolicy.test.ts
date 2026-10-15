@@ -12,12 +12,24 @@ describe('User Consent and Data-Processing Policy Engine (#510)', () => {
   const userId = 'user_test_123'
 
   it('maps all high-risk workflows to their required consent scopes', () => {
-    expect(WORKFLOW_CONSENT_REQUIREMENTS.AUTOMATED_TRADING).toBe('consent:automated_trading')
-    expect(WORKFLOW_CONSENT_REQUIREMENTS.PROFILE_ANALYTICS).toBe('consent:data_processing')
-    expect(WORKFLOW_CONSENT_REQUIREMENTS.THIRD_PARTY_EXPORT).toBe('consent:third_party_sharing')
-    expect(WORKFLOW_CONSENT_REQUIREMENTS.NOTIFICATIONS_MARKETING).toBe('consent:marketing')
-    expect(WORKFLOW_CONSENT_REQUIREMENTS.AI_PORTFOLIO_ADVISORY).toBe('consent:ai_advisory')
-    expect(WORKFLOW_CONSENT_REQUIREMENTS.TELEMETRY_COLLECTION).toBe('consent:telemetry')
+    expect(WORKFLOW_CONSENT_REQUIREMENTS.AUTOMATED_TRADING).toBe(
+      'consent:automated_trading'
+    )
+    expect(WORKFLOW_CONSENT_REQUIREMENTS.PROFILE_ANALYTICS).toBe(
+      'consent:data_processing'
+    )
+    expect(WORKFLOW_CONSENT_REQUIREMENTS.THIRD_PARTY_EXPORT).toBe(
+      'consent:third_party_sharing'
+    )
+    expect(WORKFLOW_CONSENT_REQUIREMENTS.NOTIFICATIONS_MARKETING).toBe(
+      'consent:marketing'
+    )
+    expect(WORKFLOW_CONSENT_REQUIREMENTS.AI_PORTFOLIO_ADVISORY).toBe(
+      'consent:ai_advisory'
+    )
+    expect(WORKFLOW_CONSENT_REQUIREMENTS.TELEMETRY_COLLECTION).toBe(
+      'consent:telemetry'
+    )
   })
 
   it('approves workflow when explicit consent is present', () => {
@@ -59,7 +71,9 @@ describe('User Consent and Data-Processing Policy Engine (#510)', () => {
     })
 
     expect(result.allowed).toBe(false)
-    expect(result.reason).toContain("Required user consent 'consent:automated_trading' is missing or revoked")
+    expect(result.reason).toContain(
+      "Required user consent 'consent:automated_trading' is missing or revoked"
+    )
   })
 
   it('allows workflow with valid auditable bypass and justification', () => {
@@ -68,7 +82,8 @@ describe('User Consent and Data-Processing Policy Engine (#510)', () => {
       workflow: 'AUTOMATED_TRADING',
       requiredScope: 'consent:automated_trading',
       bypassReason: 'EMERGENCY_CIRCUIT_BREAKER',
-      bypassJustification: 'Market volatility circuit breaker triggered by system risk engine',
+      bypassJustification:
+        'Market volatility circuit breaker triggered by system risk engine',
     })
 
     expect(result.allowed).toBe(true)
@@ -86,6 +101,8 @@ describe('User Consent and Data-Processing Policy Engine (#510)', () => {
     })
 
     expect(result.allowed).toBe(false)
-    expect(result.reason).toContain('Consent bypass rejected: justification must be at least 10 characters')
+    expect(result.reason).toContain(
+      'Consent bypass rejected: justification must be at least 10 characters'
+    )
   })
 })

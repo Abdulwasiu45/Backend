@@ -340,15 +340,18 @@ router.get(
     // PDF export (#538) — same data as the CSV export, rendered as a
     // paginated plain-text report rather than a formatted table.
     if (format.data.format === 'pdf') {
-      const pdf = toSimplePdf(`Portfolio Yield Report — ${period.data.period}`, [
-        `User: ${userId}`,
-        `Total yield: ${totalYield}`,
-        `Period yield: ${periodYield}`,
-        `Average APY: ${averageApy}`,
-        '',
-        'Date        Yield Amount    APY',
-        ...points.map((p) => `${p.date}  ${p.yieldAmount}  ${p.apy}`),
-      ])
+      const pdf = toSimplePdf(
+        `Portfolio Yield Report — ${period.data.period}`,
+        [
+          `User: ${userId}`,
+          `Total yield: ${totalYield}`,
+          `Period yield: ${periodYield}`,
+          `Average APY: ${averageApy}`,
+          '',
+          'Date        Yield Amount    APY',
+          ...points.map((p) => `${p.date}  ${p.yieldAmount}  ${p.apy}`),
+        ]
+      )
       res.setHeader('Content-Type', 'application/pdf')
       res.setHeader(
         'Content-Disposition',

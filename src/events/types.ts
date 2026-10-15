@@ -96,6 +96,8 @@ export const EVENT_TYPE_TOPIC: Record<UserEventType, UserEventTopic> = {
   'approval.executed': 'transactions',
   'approval.expired': 'transactions',
   'approval.cancelled': 'transactions',
+  'loan.liquidation_executed': 'transactions',
+  'loan.charged_off': 'transactions',
   'agent.rebalanced': 'agent',
   'agent.decision_recorded': 'agent',
   'agent.circuit_breaker_tripped': 'agent',

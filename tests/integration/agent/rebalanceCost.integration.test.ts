@@ -45,7 +45,8 @@ const mockOutboxOpFindUnique = jest.fn().mockResolvedValue(null)
 const mockPersistDecision = jest.fn().mockResolvedValue('decision-1')
 
 jest.mock('../../../src/agent/rebalanceDecision', () => ({
-  persistRebalanceDecision: (...args: unknown[]) => mockPersistDecision(...args),
+  persistRebalanceDecision: (...args: unknown[]) =>
+    mockPersistDecision(...args),
 }))
 
 jest.mock('../../../src/db', () => {

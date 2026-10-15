@@ -739,7 +739,10 @@ export async function executeRebalanceIfNeeded(
               .map(([protocol]) => protocol)
           )
 
-          if (positionsToMove.length === 0 || liquidityRestoreTargets.size === 0) {
+          if (
+            positionsToMove.length === 0 ||
+            liquidityRestoreTargets.size === 0
+          ) {
             await recordDecision({
               outcome: 'BLOCKED',
               blockedReason: 'liquidity_floor_shortfall',
@@ -767,17 +770,14 @@ export async function executeRebalanceIfNeeded(
             (sum, position) => sum + BigInt(position.amount),
             BigInt(0)
           )
-          totalAmount = (restoreAmount < positionAmount
-            ? restoreAmount
-            : positionAmount
+          totalAmount = (
+            restoreAmount < positionAmount ? restoreAmount : positionAmount
           ).toString()
           allProtocols = allProtocols.filter((protocol) =>
             liquidityRestoreTargets!.has(protocol.name)
           )
         } else {
-          const instantLiquidIds = new Set(
-            floorStatus.instantLiquidPositionIds
-          )
+          const instantLiquidIds = new Set(floorStatus.instantLiquidPositionIds)
           const lockedIds = new Set(floorStatus.lockedPositionIds)
           positionsToMove = userPositions.filter(
             (position) =>
@@ -793,9 +793,8 @@ export async function executeRebalanceIfNeeded(
           )
           const yieldLimit =
             yieldAmount < portfolioAmount ? yieldAmount : portfolioAmount
-          totalAmount = (yieldLimit < movableAmount
-            ? yieldLimit
-            : movableAmount
+          totalAmount = (
+            yieldLimit < movableAmount ? yieldLimit : movableAmount
           ).toString()
           if (totalAmount === '0' || positionsToMove.length === 0) {
             await recordDecision({
@@ -838,10 +837,10 @@ export async function executeRebalanceIfNeeded(
       const strategy: RebalanceStrategy = liquidityRestoreTargets
         ? new MaxYieldStrategy()
         : activeGoal
-        ? new GoalTrackingStrategy()
-        : preferredStrategy === 'TARGET_ALLOCATION'
-          ? new TargetAllocationStrategy()
-          : new MaxYieldStrategy()
+          ? new GoalTrackingStrategy()
+          : preferredStrategy === 'TARGET_ALLOCATION'
+            ? new TargetAllocationStrategy()
+            : new MaxYieldStrategy()
 
       // Risk ceiling is opt-in per user (or per goal). Only when a ceiling is
       // set do we load the current ProtocolRiskScore rows and pass them to the
@@ -890,7 +889,8 @@ export async function executeRebalanceIfNeeded(
 
       // #550 - Wash-sale-aware rebalancing check (informational + opt-in soft deprioritization)
       let washSaleRisk = false
-      const taxAwareRebalancing = userStrategyPreferences[0]?.taxAwareRebalancing ?? false
+      const taxAwareRebalancing =
+        userStrategyPreferences[0]?.taxAwareRebalancing ?? false
       if (decision.shouldRebalance) {
         const likelyRebuy = isSameAssetRebuyLikely(
           userStrategyPreferences[0]?.strategyName ?? null,
@@ -921,13 +921,17 @@ export async function executeRebalanceIfNeeded(
               })
 
               if (taxAwareRebalancing) {
-                const higherThreshold = effectiveThresholds.minimumImprovement * 2
-                const targetProtocolData = allProtocols.find(p => p.name === decision.targetProtocol)
+                const higherThreshold =
+                  effectiveThresholds.minimumImprovement * 2
+                const targetProtocolData = allProtocols.find(
+                  (p) => p.name === decision.targetProtocol
+                )
                 if (targetProtocolData) {
                   const netImprovement = targetProtocolData.apy - currentApy
                   if (netImprovement < higherThreshold) {
                     decision.shouldRebalance = false
-                    decision.reasoning = 'Wash-sale risk: improvement below elevated threshold'
+                    decision.reasoning =
+                      'Wash-sale risk: improvement below elevated threshold'
                   }
                 }
               }

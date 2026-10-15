@@ -32,16 +32,19 @@ export interface QboTransaction {
  * Convert transactions to QuickBooks Online-compatible QBO format.
  * This is a simplified OFX-style format that QBO can import.
  */
-export function toQbo(transactions: Array<{
-  type: TransactionType
-  amount: string
-  assetSymbol: string
-  fee?: string | null
-  createdAt: Date
-  protocolName?: string | null
-}>): string {
+export function toQbo(
+  transactions: Array<{
+    type: TransactionType
+    amount: string
+    assetSymbol: string
+    fee?: string | null
+    createdAt: Date
+    protocolName?: string | null
+  }>
+): string {
   const qboTransactions: QboTransaction[] = transactions.map((tx) => {
-    const category = TRANSACTION_TYPE_TO_QBO_CATEGORY[tx.type] || 'Uncategorized'
+    const category =
+      TRANSACTION_TYPE_TO_QBO_CATEGORY[tx.type] || 'Uncategorized'
     const amount = Number(tx.amount)
     const fee = tx.fee ? Number(tx.fee) : 0
 

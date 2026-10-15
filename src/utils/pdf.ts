@@ -20,7 +20,8 @@ function escapePdfText(text: string): string {
 
 function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = []
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  for (let i = 0; i < items.length; i += size)
+    out.push(items.slice(i, i + size))
   return out
 }
 
@@ -51,7 +52,9 @@ export function toSimplePdf(title: string, lines: string[]): Buffer {
     let y = PAGE_HEIGHT - MARGIN
     streamLines.push(`BT /F1 ${FONT_SIZE} Tf ${MARGIN} ${y} Td`)
     if (i === 0) {
-      streamLines.push(`(${escapePdfText(title)}) Tj 0 -${LINE_HEIGHT * 1.5} Td`)
+      streamLines.push(
+        `(${escapePdfText(title)}) Tj 0 -${LINE_HEIGHT * 1.5} Td`
+      )
     }
     for (const line of pageLines) {
       streamLines.push(`(${escapePdfText(line)}) Tj 0 -${LINE_HEIGHT} Td`)
