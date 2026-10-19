@@ -22,6 +22,8 @@
 - **[PRISMA_QUERY_PERFORMANCE.md](PRISMA_QUERY_PERFORMANCE.md)** - Hot webhook query plans, supporting indexes, and the query-index regression check
 - **[NET_WORTH.md](NET_WORTH.md)** - Read-only external Stellar links, valuation/staleness semantics, and private scope
 - **[CONSENT_AND_PRIVACY_POLICY.md](CONSENT_AND_PRIVACY_POLICY.md)** - User consent boundaries, high-risk workflow checks & auditable bypass policy (#510)
+- **[RATE_LIMITING.md](RATE_LIMITING.md)** - Rate-limit tier catalogue & route→tier matrix: auth-type mapping, effective budgets, fail-open/fail-closed policy (#614)
+- **[API_KEYS.md](API_KEYS.md)** - User & admin API key scope catalogue: descriptions, risk levels, enforcement status, and the endpoints each scope covers (#615)
 
 ### For DevOps/Deployment
 

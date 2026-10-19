@@ -32,6 +32,11 @@ import {
   manualResetBreaker,
 } from '../agent/breakerService'
 import { messageDeliveryService } from '../messaging'
+import {
+  getAdminScopeCatalog,
+  getUserScopeCatalog,
+} from '../auth/scopeCoverage'
+import { DEFAULT_READ_SCOPES } from '../auth/scopes'
 
 const router = Router()
 const prisma = db
@@ -1080,6 +1085,62 @@ router.post(
         success: false,
         error: 'Failed to rotate admin key',
       })
+    }
+  }
+)
+
+/**
+ * GET /api/admin/keys/scopes
+ * The machine-readable scope catalogue (#615).
+ *
+ * Serves both scope families with their description, risk level, guardrail
+ * notes and the endpoints each scope actually covers, so the key-creation UI
+ * can show an operator exactly what granting a scope would hand over.
+ *
+ * The endpoint lists are derived from the live route table
+ * (src/auth/scopeCoverage.ts), so a scope cannot claim to unlock an endpoint
+ * that stopped requiring it.
+ *
+ * Required scope: keys:read
+ */
+router.get(
+  '/keys/scopes',
+  requireAdminScope('keys:read'),
+  async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
+    try {
+      const data = {
+        user: {
+          defaultReadScopes: DEFAULT_READ_SCOPES,
+          scopes: getUserScopeCatalog(),
+        },
+        admin: {
+          scopes: getAdminScopeCatalog(),
+        },
+      }
+
+      auditLog(req, res, 'LIST_SCOPE_CATALOG', 'success', {
+        userScopes: data.user.scopes.length,
+        adminScopes: data.admin.scopes.length,
+      })
+
+      res.status(200).json({
+        success: true,
+        data,
+        timestamp: new Date().toISOString(),
+      })
+    } catch (error) {
+      logger.error('[Admin] Failed to build scope catalogue', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      res
+        .status(500)
+        .json({ success: false, error: 'Failed to build scope catalogue' })
     }
   }
 )
