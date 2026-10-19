@@ -340,6 +340,10 @@ in `prisma/migrations/<name>/` therefore ships a hand-written `rollback.sql`
 alongside its `migration.sql`. CI enforces this via
 `scripts/check-migration-rollback.sh`.
 
+For a migration that failed mid-apply (`P3009`, `CONCURRENTLY` in a
+transaction, duplicate column, stuck rehearsal), follow
+[MIGRATIONS.md Appendix A: Common failure modes](./MIGRATIONS.md#appendix-a-common-failure-modes).
+
 ### When to roll back
 
 Roll back when a freshly deployed migration is itself the problem (broken schema,

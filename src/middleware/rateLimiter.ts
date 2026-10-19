@@ -402,6 +402,18 @@ export const adminRateLimiter = buildRateLimiter({
 })
 
 /**
+ * Privacy-erasure limiter — irreversible operations, kept far below the
+ * general admin budget. 5 req / 15 min per admin principal.
+ */
+export const erasureRateLimiter = buildRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  skip: isHealthProbe,
+  limiterType: 'admin',
+  message: 'Too many erasure operations. Please try again later.',
+})
+
+/**
  * Webhook rate limiter — applied to unauthenticated inbound webhooks.
  * Defaults: 30 req / 1 min (env: WEBHOOK_RATE_LIMIT_MAX / WEBHOOK_RATE_LIMIT_WINDOW_MS).
  */

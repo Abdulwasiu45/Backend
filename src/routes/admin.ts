@@ -2560,7 +2560,10 @@ import {
   executeErasure,
   listErasureRequests,
   previewErasure,
+  previewErasureRequest,
+  ErasureGuardError,
 } from '../compliance/privacyErasure'
+import { erasureRateLimiter } from '../middleware/rateLimiter'
 
 /**
  * GET /api/admin/erasure/requests
@@ -2605,6 +2608,7 @@ router.get(
  */
 router.post(
   '/erasure/requests',
+  erasureRateLimiter,
   requireAdminScope('write'),
   async (req: Request, res: Response) => {
     try {
@@ -2653,6 +2657,7 @@ router.post(
  */
 router.post(
   '/erasure/requests/:id/approve',
+  erasureRateLimiter,
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
     try {
@@ -2677,11 +2682,15 @@ router.post(
       auditLog(req, res, 'APPROVE_ERASURE_REQUEST', 'failure', {
         error: error instanceof Error ? error.message : 'Unknown error',
       })
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error ? error.message : 'Failed to approve request',
-      })
+      res
+        .status(error instanceof ErasureGuardError ? error.httpStatus : 500)
+        .json({
+          success: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Failed to approve request',
+        })
     }
   }
 )
@@ -2695,6 +2704,7 @@ router.post(
  */
 router.post(
   '/erasure/requests/:id/reject',
+  erasureRateLimiter,
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
     try {
@@ -2744,15 +2754,38 @@ router.post(
  * POST /api/admin/erasure/requests/:id/execute
  * Execute an approved erasure request. THIS IS IRREVERSIBLE.
  * Required scope: super
+ *
+ * Guardrails:
+ * - Without `confirm` in the body this is a dry run: it returns the preview and
+ *   the exact phrase required, and changes nothing.
+ * - With `confirm: "DELETE <userId>"` the erasure runs, provided the caller is
+ *   a different admin than the approver (dual control).
+ * - The user's sessions are revoked before any data is deleted.
+ *
+ * Body: { confirm?: string }
  */
 router.post(
   '/erasure/requests/:id/execute',
+  erasureRateLimiter,
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
     try {
       const { id } = req.params
+      const adminAuth = res.locals.adminAuth
+      const confirm =
+        typeof req.body?.confirm === 'string' ? req.body.confirm : undefined
 
-      const summary = await executeErasure(id)
+      if (confirm === undefined) {
+        const dryRun = await previewErasureRequest(id)
+        return res.json({
+          success: true,
+          dryRun: true,
+          data: dryRun,
+          timestamp: new Date().toISOString(),
+        })
+      }
+
+      const summary = await executeErasure(id, adminAuth.name, confirm)
 
       auditLog(req, res, 'EXECUTE_ERASURE', 'success', {
         requestId: id,
@@ -2761,6 +2794,7 @@ router.post(
 
       res.json({
         success: true,
+        dryRun: false,
         data: summary,
         timestamp: new Date().toISOString(),
       })
@@ -2771,11 +2805,15 @@ router.post(
       auditLog(req, res, 'EXECUTE_ERASURE', 'failure', {
         error: error instanceof Error ? error.message : 'Unknown error',
       })
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error ? error.message : 'Failed to execute erasure',
-      })
+      res
+        .status(error instanceof ErasureGuardError ? error.httpStatus : 500)
+        .json({
+          success: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Failed to execute erasure',
+        })
     }
   }
 )
@@ -2787,6 +2825,7 @@ router.post(
  */
 router.get(
   '/erasure/preview/:userId',
+  erasureRateLimiter,
   requireAdminScope('read'),
   async (req: Request, res: Response) => {
     try {
