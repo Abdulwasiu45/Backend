@@ -111,6 +111,12 @@ export const secretCredentialValidationFailures = new client.Gauge({
   registers: [register],
 })
 
+export const stellarSignerRotationOverdueDays = new client.Gauge({
+  name: 'stellar_signer_rotation_overdue_days',
+  help: 'Days beyond the quarterly Stellar signer rotation due date',
+  registers: [register],
+})
+
 // ── Cursor/Lag Metrics ──────────────────────────────────────────────────────────
 
 export const cursorLag = new client.Gauge({

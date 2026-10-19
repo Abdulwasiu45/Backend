@@ -66,6 +66,7 @@ import { schedulePortfolioRiskJob } from './jobs/portfolioRisk'
 import { scheduleApprovalExpiry } from './jobs/approvalExpiry'
 import { scheduleReserveReconciliation } from './jobs/reserveReconciliation'
 import { scheduleMessageDeliverySweep } from './jobs/messageDeliverySweep'
+import { scheduleSignerRotation } from './jobs/signerRotation'
 import { scheduleLoanAccrual } from './jobs/loanAccrual'
 import { scheduleLoanLiquidationMonitor } from './jobs/loanLiquidationMonitor'
 import { scheduleLinkedExternalWalletSync } from './jobs/linkedExternalWalletSync'
@@ -157,6 +158,7 @@ let portfolioRiskJobHandle: NodeJS.Timeout | null = null
 let approvalExpiryHandle: NodeJS.Timeout | null = null
 let reserveReconciliationHandle: NodeJS.Timeout | null = null
 let messageDeliverySweepHandle: NodeJS.Timeout | null = null
+let signerRotationHandle: NodeJS.Timeout | null = null
 let outboundNotificationsHandle: NodeJS.Timeout | null = null
 let linkedExternalWalletSyncHandle: NodeJS.Timeout | null = null
 let loanAccrualHandle: NodeJS.Timeout | null = null
@@ -540,6 +542,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
     logger.info('[Shutdown] Message delivery sweep timer cleared')
   }
 
+  if (signerRotationHandle) {
+    clearInterval(signerRotationHandle)
+    signerRotationHandle = null
+    logger.info('[Shutdown] Signer rotation timer cleared')
+  }
+
   if (linkedExternalWalletSyncHandle) {
     clearInterval(linkedExternalWalletSyncHandle)
     linkedExternalWalletSyncHandle = null
@@ -779,6 +787,7 @@ async function main(): Promise<void> {
   approvalExpiryHandle = scheduleApprovalExpiry()
   reserveReconciliationHandle = scheduleReserveReconciliation()
   messageDeliverySweepHandle = scheduleMessageDeliverySweep()
+  signerRotationHandle = scheduleSignerRotation()
   outboundNotificationsHandle = scheduleOutboundNotifications()
   linkedExternalWalletSyncHandle = scheduleLinkedExternalWalletSync()
   // #532 — accrual first, then the monitor: the monitor values loans, and it
