@@ -44,6 +44,11 @@ import {
   securityHeaders,
   permissionsPolicy,
 } from './middleware/security'
+import {
+  featureFlagMiddleware,
+  emergencyMaintenanceGuard,
+} from './middleware/featureFlags'
+import { featureFlagManager } from './config/featureFlags'
 import { logger } from './utils/logger'
 import { startAgentLoop, stopAgentLoop } from './agent/loop'
 import { connectDb } from './db'
@@ -193,6 +198,7 @@ app.use((req: Request & { user?: { id: string } }, _res: Response, next) => {
 })
 
 app.use(requestLogger)
+app.use(featureFlagMiddleware)
 app.use(trustedIpBypass)
 // The app-wide rate-limit chain: the flat global budget, then the identity
 // tier. Both apply to every request, so no route is ever unlimited. Kept in
@@ -200,6 +206,7 @@ app.use(trustedIpBypass)
 // that claim against the real chain.
 app.use(...APP_LEVEL_LIMITERS)
 app.use(requestTimeoutMiddleware)
+app.use(emergencyMaintenanceGuard)
 
 // Advertise the served API version on every response — must be registered
 // before the first route (including the health probes below).
@@ -610,6 +617,19 @@ async function initServices(): Promise<void> {
   } catch (error) {
     logger.error(
       '[Startup] Fee oracle failed to start — continuing with defaults',
+      {
+        error: error instanceof Error ? error.message : String(error),
+      }
+    )
+  }
+
+  // 5. Feature Flags Redis Sync (#494) — best-effort, never blocks startup
+  try {
+    await featureFlagManager.syncFromRedis()
+    logger.info('[Startup] Feature flag Redis sync initialized ✓')
+  } catch (error) {
+    logger.warn(
+      '[Startup] Feature flag Redis sync failed — continuing with local configuration',
       {
         error: error instanceof Error ? error.message : String(error),
       }

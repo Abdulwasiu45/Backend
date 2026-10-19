@@ -52,6 +52,7 @@ function main() {
   const audit = spawnSync('npm', ['audit', '--omit=dev', '--json'], {
     cwd: root,
     encoding: 'utf8',
+    shell: true,
     maxBuffer: 10 * 1024 * 1024,
   })
   if (!audit.stdout) throw new Error(audit.stderr || 'npm audit produced no JSON')

@@ -85,13 +85,18 @@ function routesOf(file, prefix, seen = new Set()) {
 }
 
 function mountedRoutes() {
-  const indexFile = path.join(SRC, 'index.ts')
-  const source = read(indexFile)
-  const imports = importMap(indexFile, source)
+  const registryFile = path.join(SRC, 'routes', 'registry.ts')
+  const targetFile = fs.existsSync(registryFile)
+    ? registryFile
+    : path.join(SRC, 'index.ts')
+  const source = read(targetFile)
+  const imports = importMap(targetFile, source)
   const all = new Set()
+  const block =
+    source.match(/export const API_ROUTES[\s\S]*?\n\]/)?.[0] || source
   const re = /path:\s*'([^']+)',\s*handlers:\s*\[([^\]]*)\]/g
   let m
-  while ((m = re.exec(source))) {
+  while ((m = re.exec(block))) {
     const ids = m[2].match(/\w+/g) || []
     const router = ids[ids.length - 1]
     if (!imports[router]) continue

@@ -50,6 +50,9 @@ export const ADMIN_SCOPES = [
   // #394 — GDPR/CCPA right-to-erasure
   'erasure:write',
   'erasure:read',
+  // #494 — feature flags management and staged rollout/rollback
+  'flags:read',
+  'flags:write',
   // #493 — Telegram and WhatsApp message delivery management & recovery
   'messages:read',
   'messages:write',
@@ -293,6 +296,21 @@ export const ADMIN_SCOPE_CATALOG: Record<AdminScope, ScopeDefinition> = {
       'Execution requires super — approval and execution are deliberately ' +
       'separated so one operator cannot both authorise and carry out a ' +
       'deletion.',
+  },
+  'flags:read': {
+    scope: 'flags:read',
+    enforcement: 'enforced',
+    description: 'Read feature flags and rollout state.',
+    risk: 'read',
+    grants: 'Feature flags list, evaluation details and rollback history.',
+  },
+  'flags:write': {
+    scope: 'flags:write',
+    enforcement: 'enforced',
+    description: 'Manage feature flags, staged rollouts and emergency rollbacks.',
+    risk: 'operational',
+    grants:
+      'Update runtime overrides, advance staged rollouts, reset flags, and trigger emergency rollbacks.',
   },
   'messages:read': {
     scope: 'messages:read',
