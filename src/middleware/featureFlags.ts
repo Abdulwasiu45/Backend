@@ -14,6 +14,7 @@ import { logger } from '../utils/logger'
 
 // Augment Express Request type to include feature flag helpers
 declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       isFeatureEnabled?: (flagKey: string) => boolean

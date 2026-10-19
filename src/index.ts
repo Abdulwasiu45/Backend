@@ -32,14 +32,13 @@ import {
 import { requestLogger } from './middleware/logger'
 import { requestTimeoutMiddleware } from './middleware/requestTimeout'
 import {
-  rateLimiter,
-  tieredRateLimiter,
   authRateLimiter,
   adminRateLimiter,
   internalRateLimiter,
   webhookRateLimiter,
   trustedIpBypass,
 } from './middleware/rateLimiter'
+import { APP_LEVEL_LIMITERS } from './middleware/rateLimiterChain'
 import {
   configureTrustProxy,
   securityHeaders,
@@ -71,6 +70,7 @@ import { schedulePortfolioRiskJob } from './jobs/portfolioRisk'
 import { scheduleApprovalExpiry } from './jobs/approvalExpiry'
 import { scheduleReserveReconciliation } from './jobs/reserveReconciliation'
 import { scheduleMessageDeliverySweep } from './jobs/messageDeliverySweep'
+import { scheduleSignerRotation } from './jobs/signerRotation'
 import { scheduleLoanAccrual } from './jobs/loanAccrual'
 import { scheduleLoanLiquidationMonitor } from './jobs/loanLiquidationMonitor'
 import { scheduleLinkedExternalWalletSync } from './jobs/linkedExternalWalletSync'
@@ -78,47 +78,7 @@ import { startEventListener, stopEventListener } from './stellar/events'
 import { startEventBridge, stopEventBridge } from './events/bridge'
 import { attachWebSocketServer, closeWebSocketServer } from './ws/server'
 import { validateStellarNetworkReady } from './config/readiness'
-import healthRouter from './routes/health'
-import agentRouter from './routes/agent'
-import agentDecisionsRouter from './routes/agent-decisions'
-import authRouter from './routes/auth'
-import whatsappRouter from './routes/whatsapp'
-import telegramRouter from './routes/telegram'
-import portfolioRouter from './routes/portfolio'
-import transactionsRouter from './routes/transactions'
-import protocolsRouter from './routes/protocols'
-import depositRouter from './routes/deposit'
-import withdrawRouter from './routes/withdraw'
-import loansRouter from './routes/loans'
-import protectionFundRouter from './routes/protection-fund'
-import settingsRouter from './routes/settings'
-import vaultRouter from './routes/vault'
-import analyticsRouter from './routes/analytics'
-import adminRouter from './routes/admin'
-import metricsRouter from './routes/metrics'
-import stellarRouter from './routes/stellar'
-import webhooksRouter from './routes/webhooks'
-import fiatRouter from './routes/fiat'
-import referralsRouter from './routes/referrals'
-import recurringDepositRouter from './routes/recurring-deposits'
-import recurringWithdrawalRouter from './routes/recurring-withdrawals'
-import alertsRouter from './routes/alerts'
-import strategiesRouter from './routes/strategies'
-import subAccountsRouter from './routes/sub-accounts'
-import supportTicketsRouter from './routes/support-tickets'
-import adminSupportTicketsRouter from './routes/admin/support-tickets'
-import assistantRouter from './routes/assistant'
-import approvalsRouter from './routes/approvals'
-import approvalPoliciesRouter from './routes/approval-policies'
-import keysRouter from './routes/keys'
-import sessionsRouter from './routes/sessions'
-import webAuthnRouter from './routes/webauthn'
-import streamRouter from './routes/stream'
-import notificationsRouter from './routes/notifications'
-import liquidityFloorRouter from './routes/liquidity-floor'
-import notificationDlqRouter from './routes/notification-dlq'
-import networkRouter from './routes/network'
-import netWorthRouter from './routes/net-worth'
+import { API_ROUTES, EXTRA_MOUNTS } from './routes/registry'
 import {
   corsMiddleware,
   jsonBodyParser,
@@ -162,6 +122,7 @@ let portfolioRiskJobHandle: NodeJS.Timeout | null = null
 let approvalExpiryHandle: NodeJS.Timeout | null = null
 let reserveReconciliationHandle: NodeJS.Timeout | null = null
 let messageDeliverySweepHandle: NodeJS.Timeout | null = null
+let signerRotationHandle: NodeJS.Timeout | null = null
 let outboundNotificationsHandle: NodeJS.Timeout | null = null
 let linkedExternalWalletSyncHandle: NodeJS.Timeout | null = null
 let loanAccrualHandle: NodeJS.Timeout | null = null
@@ -239,14 +200,11 @@ app.use((req: Request & { user?: { id: string } }, _res: Response, next) => {
 app.use(requestLogger)
 app.use(featureFlagMiddleware)
 app.use(trustedIpBypass)
-app.use(rateLimiter)
-// #473 — identity tiering. This single limiter charges anonymous callers to a
-// strict per-IP budget and authenticated callers to a generous per-principal one
-// (see tieredRateLimiter). It resolves identity from the request itself, so it
-// works here, ahead of each route's auth middleware: API keys are self-
-// describing in the Authorization header, and session tokens are classified once
-// the auth middleware has resolved req.userId.
-app.use(tieredRateLimiter)
+// The app-wide rate-limit chain: the flat global budget, then the identity
+// tier. Both apply to every request, so no route is ever unlimited. Kept in
+// src/middleware/rateLimiterChain.ts so the tier-matrix CI check can assert
+// that claim against the real chain.
+app.use(...APP_LEVEL_LIMITERS)
 app.use(requestTimeoutMiddleware)
 app.use(emergencyMaintenanceGuard)
 
@@ -356,66 +314,16 @@ interface ApiRoute {
   handlers: express.RequestHandler[]
 }
 
-const apiRoutes: ApiRoute[] = [
-  { path: 'network', handlers: [networkRouter] },
-  { path: 'net-worth', handlers: [netWorthRouter] },
-  { path: 'agent/decisions', handlers: [agentDecisionsRouter] },
-  { path: 'agent', handlers: [internalRateLimiter, agentRouter] },
-  { path: 'auth/webauthn', handlers: [authRateLimiter, webAuthnRouter] },
-  { path: 'auth', handlers: [authRateLimiter, authRouter] },
-  { path: 'webauthn', handlers: [authRateLimiter, webAuthnRouter] },
-  { path: 'whatsapp', handlers: [webhookRateLimiter, whatsappRouter] },
-  { path: 'telegram', handlers: [webhookRateLimiter, telegramRouter] },
-  { path: 'portfolio', handlers: [portfolioRouter] },
-  { path: 'transactions', handlers: [transactionsRouter] },
-  { path: 'protocols', handlers: [protocolsRouter] },
-  { path: 'deposit', handlers: [depositRouter] },
-  { path: 'withdraw', handlers: [withdrawRouter] },
-  // #532 — collateral loans. Mounted beside withdraw rather than inside
-  // portfolio: a loan is its own lifecycle with its own approval and rate
-  // limits, and it must not inherit portfolio's read-only scope set.
-  { path: 'loans', handlers: [loansRouter] },
-  // #533 — protocol-risk protection fund
-  { path: 'protection-fund', handlers: [protectionFundRouter] },
-  // #534 — user settings (display currency)
-  { path: 'settings', handlers: [settingsRouter] },
-  { path: 'vault', handlers: [vaultRouter] },
-  { path: 'analytics', handlers: [analyticsRouter] },
-  { path: 'stellar', handlers: [stellarRouter] },
-  { path: 'fiat', handlers: [fiatRouter] },
-  { path: 'referrals', handlers: [referralsRouter] },
-  { path: 'deposit/recurring', handlers: [recurringDepositRouter] },
-  { path: 'recurring-withdrawals', handlers: [recurringWithdrawalRouter] },
-  { path: 'alerts', handlers: [alertsRouter] },
-  { path: 'strategies', handlers: [strategiesRouter] },
-  { path: 'sub-accounts', handlers: [subAccountsRouter] },
-  { path: 'support/tickets', handlers: [supportTicketsRouter] },
-  {
-    path: 'admin/support/tickets',
-    handlers: [adminRateLimiter, adminSupportTicketsRouter],
-  },
-  { path: 'assistant', handlers: [assistantRouter] },
-  { path: 'approvals', handlers: [approvalsRouter] },
-  { path: 'approval-policies', handlers: [approvalPoliciesRouter] },
-  { path: 'keys', handlers: [keysRouter] },
-  { path: 'sessions', handlers: [sessionsRouter] },
-  { path: 'stream', handlers: [streamRouter] },
-  { path: 'notifications', handlers: [notificationsRouter] },
-  { path: 'liquidity-floor', handlers: [liquidityFloorRouter] },
-  {
-    path: 'admin/notifications/dlq',
-    handlers: [adminRateLimiter, notificationDlqRouter],
-  },
-  { path: 'admin', handlers: [adminRateLimiter, adminRouter] },
-]
+const apiRoutes: ApiRoute[] = API_ROUTES
 
 // ── Application routes ────────────────────────────────────────────────────────
 
-app.use('/health', healthRouter)
-app.use('/api/analytics', analyticsRouter)
-app.use('/api/stellar', stellarRouter)
-app.use('/api/webhooks', webhooksRouter)
-app.use('/metrics', metricsRouter)
+// Operational endpoints and the pre-version paths (health, metrics, the legacy
+// webhooks surface). Declared in src/routes/registry.ts so the tier matrix
+// can describe every route the server serves, not just the versioned ones.
+for (const mount of EXTRA_MOUNTS) {
+  app.use(mount.path, ...mount.handlers)
+}
 
 // Primary, versioned mounts: /api/v1/*
 for (const route of apiRoutes) {
@@ -545,6 +453,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
     clearInterval(messageDeliverySweepHandle)
     messageDeliverySweepHandle = null
     logger.info('[Shutdown] Message delivery sweep timer cleared')
+  }
+
+  if (signerRotationHandle) {
+    clearInterval(signerRotationHandle)
+    signerRotationHandle = null
+    logger.info('[Shutdown] Signer rotation timer cleared')
   }
 
   if (linkedExternalWalletSyncHandle) {
@@ -799,6 +713,7 @@ async function main(): Promise<void> {
   approvalExpiryHandle = scheduleApprovalExpiry()
   reserveReconciliationHandle = scheduleReserveReconciliation()
   messageDeliverySweepHandle = scheduleMessageDeliverySweep()
+  signerRotationHandle = scheduleSignerRotation()
   outboundNotificationsHandle = scheduleOutboundNotifications()
   linkedExternalWalletSyncHandle = scheduleLinkedExternalWalletSync()
   // #532 — accrual first, then the monitor: the monitor values loans, and it
