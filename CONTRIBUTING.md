@@ -185,6 +185,20 @@ Every issue carries exactly one primary type label, plus community and dispositi
 
 When a triage pass (a **Backlog Cleanup** issue) touches a batch of issues, list every item and its outcome in the pass issue so the decision trail stays auditable.
 
+## Repo Hygiene
+
+Durable guidance belongs in `docs/` (MIGRATIONS.md, RUNBOOK.md, etc.). The CI job in `.github/workflows/repo-hygiene.yml` **fails a PR** when it adds any of these at the repo root:
+
+- `PR_*SUMMARY*.md`, `IMPLEMENTATION_SUMMARY.md`, `*FIX*.md`, `*GUIDE*.md`
+- `verify_*.sh`, `fix-*.sh`
+- Anything under `docs/superpowers/plans/`
+
+One-off implementation notes, fix scripts, and rehearsal guides do not belong in the repository root. If you find yourself writing one, put the durable parts into `docs/` and leave the rest in the PR description.
+
+## Env File Policy
+
+Tracked env files (`.env.example`, `.env.development`, `.env.production`, `.env.test`) contain **placeholders only** — never real credentials. The `.gitignore` explicitly allows exactly these four files. The CI job in `.github/workflows/env-secret-scan.yml` fails if a high-entropy secret pattern is found in any tracked `.env*` file.
+
 ## Need Help?
 
 - Check existing [documentation](docs/)

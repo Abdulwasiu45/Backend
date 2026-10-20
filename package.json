@@ -8,6 +8,8 @@
     "dev": "nodemon --exec ts-node src/app.ts",
     "build": "tsc -p tsconfig.build.json",
     "test": "jest",
+    "pretest": "npx prisma generate",
+    "prebuild": "npm run clean && npm run build:spec && npx prisma generate",
     "test:unit": "jest tests/unit",
     "test:integration": "jest tests/integration",
     "prisma:generate": "npx prisma generate",
@@ -33,7 +35,6 @@
     "docs:rate-limits": "ts-node scripts/rate-limit-doc-tables.ts",
     "docs:scopes": "ts-node scripts/scope-doc-tables.ts",
     "build:spec": "mkdir -p dist/docs && cp docs/openapi.yaml dist/docs/openapi.yaml",
-    "prebuild": "npm run clean && npm run build:spec",
     "prestart": "npm run build",
     "release:preflight": "bash scripts/release-preflight.sh"
   },
