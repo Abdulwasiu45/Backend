@@ -2624,6 +2624,12 @@ router.get(
   '/erasure/requests',
   requireAdminScope('read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { status, limit, offset } = req.query
       const result = await listErasureRequests({
@@ -2661,6 +2667,12 @@ router.post(
   erasureRateLimiter,
   requireAdminScope('write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { userId, reason } = req.body
       const adminAuth = res.locals.adminAuth
@@ -2710,9 +2722,14 @@ router.post(
   erasureRateLimiter,
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { id } = req.params
-      const adminAuth = res.locals.adminAuth
 
       const request = await approveErasureRequest(id, adminAuth.name)
 
@@ -2757,6 +2774,12 @@ router.post(
   erasureRateLimiter,
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { id } = req.params
       const { rejectionReason } = req.body
@@ -2819,9 +2842,14 @@ router.post(
   erasureRateLimiter,
   requireAdminScope('super'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { id } = req.params
-      const adminAuth = res.locals.adminAuth
       const confirm =
         typeof req.body?.confirm === 'string' ? req.body.confirm : undefined
 
@@ -2878,6 +2906,12 @@ router.get(
   erasureRateLimiter,
   requireAdminScope('read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { userId } = req.params
 
@@ -2917,6 +2951,12 @@ router.get(
   '/referrals/review',
   requireAdminScope('read'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const conversions = await listConversionsForReview()
 
@@ -2946,9 +2986,14 @@ router.post(
   '/referrals/review/:id/approve',
   requireAdminScope('write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { id } = req.params
-      const adminAuth = res.locals.adminAuth
 
       await approveReferralConversion(id, adminAuth.name)
 
@@ -2986,10 +3031,15 @@ router.post(
   '/referrals/review/:id/reject',
   requireAdminScope('write'),
   async (req: Request, res: Response) => {
+    const adminAuth = getAdminAuth(res)
+    if (!adminAuth) {
+      return res
+        .status(401)
+        .json({ success: false, error: 'Admin authentication required' })
+    }
     try {
       const { id } = req.params
       const { rejectionReason } = req.body
-      const adminAuth = res.locals.adminAuth
 
       if (!rejectionReason) {
         return res.status(400).json({
@@ -3235,22 +3285,18 @@ router.put(
       }
 
       if (allowlist !== undefined && !Array.isArray(allowlist)) {
-        res
-          .status(400)
-          .json({
-            success: false,
-            error: 'allowlist must be an array of strings',
-          })
+        res.status(400).json({
+          success: false,
+          error: 'allowlist must be an array of strings',
+        })
         return
       }
 
       if (blocklist !== undefined && !Array.isArray(blocklist)) {
-        res
-          .status(400)
-          .json({
-            success: false,
-            error: 'blocklist must be an array of strings',
-          })
+        res.status(400).json({
+          success: false,
+          error: 'blocklist must be an array of strings',
+        })
         return
       }
 

@@ -575,7 +575,7 @@ export function recordAnalyticsRequest(
  */
 export function recordBackgroundJob(
   job: string,
-  status: 'success' | 'failed',
+  status: 'success' | 'failed' | 'dry_run',
   durationSeconds: number
 ): void {
   backgroundJobsTotal.inc({ job, status })
