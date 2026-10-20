@@ -1,10 +1,16 @@
-import { Keypair } from '@stellar/stellar-sdk';
-import * as crypto from 'crypto';
-import db from '../db';
-import { logger } from '../utils/logger';
+import { Keypair } from '@stellar/stellar-sdk'
+import * as crypto from 'crypto'
+import db from '../db'
+import { logger } from '../utils/logger'
+import {
+  deriveBootstrapLabel,
+  getOrRegisterKey,
+  hashKey,
+} from '../keys/registry'
+import { pickSponsor, SponsorCapacityExhaustedError } from './sponsorship'
 
-const ALGORITHM = 'aes-256-gcm';
-const HEX_64_REGEX = /^[0-9a-fA-F]{64}$/;
+const ALGORITHM = 'aes-256-gcm'
+const HEX_64_REGEX = /^[0-9a-fA-F]{64}$/
 
 /**
  * Validate that a value is exactly 64 hex characters (32 bytes).
@@ -19,10 +25,12 @@ const HEX_64_REGEX = /^[0-9a-fA-F]{64}$/;
  */
 function assertValidHexKey(value: string, label: string): void {
   if (!value || value.length !== 64) {
-    throw new Error(`${label} must be 64 hex characters (32 bytes)`);
+    throw new Error(`${label} must be 64 hex characters (32 bytes)`)
   }
   if (!HEX_64_REGEX.test(value)) {
-    throw new Error(`${label} must contain only hexadecimal characters (0-9, a-f, A-F)`);
+    throw new Error(
+      `${label} must contain only hexadecimal characters (0-9, a-f, A-F)`
+    )
   }
 }
 
@@ -31,9 +39,9 @@ function assertValidHexKey(value: string, label: string): void {
  * Must be 64 hex characters (32 bytes).
  */
 function getEncryptionKey(): string {
-  const key = process.env.WALLET_ENCRYPTION_KEY || '';
-  assertValidHexKey(key, 'WALLET_ENCRYPTION_KEY');
-  return key;
+  const key = process.env.WALLET_ENCRYPTION_KEY || ''
+  assertValidHexKey(key, 'WALLET_ENCRYPTION_KEY')
+  return key
 }
 
 /**
@@ -43,34 +51,38 @@ function getEncryptionKey(): string {
  * rather than throwing, since a bad fallback key shouldn't break primary reads).
  */
 function getFallbackEncryptionKey(): string | undefined {
-  const key = process.env.WALLET_ENCRYPTION_KEY_OLD;
-  if (!key) return undefined;
+  const key = process.env.WALLET_ENCRYPTION_KEY_OLD
+  if (!key) return undefined
 
   try {
-    assertValidHexKey(key, 'WALLET_ENCRYPTION_KEY_OLD');
+    assertValidHexKey(key, 'WALLET_ENCRYPTION_KEY_OLD')
   } catch (err) {
     logger.warn(
       `WALLET_ENCRYPTION_KEY_OLD invalid; ignoring fallback key: ${err instanceof Error ? err.message : 'unknown error'}`
-    );
-    return undefined;
+    )
+    return undefined
   }
 
-  return key;
+  return key
 }
 
-function encryptSecret(secret: string): { encrypted: string; iv: string; authTag: string } {
-  const key = Buffer.from(getEncryptionKey(), 'hex');
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+function encryptSecret(secret: string): {
+  encrypted: string
+  iv: string
+  authTag: string
+} {
+  const key = Buffer.from(getEncryptionKey(), 'hex')
+  const iv = crypto.randomBytes(16)
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv)
 
-  let encrypted = cipher.update(secret, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
+  let encrypted = cipher.update(secret, 'utf8', 'hex')
+  encrypted += cipher.final('hex')
 
   return {
     encrypted,
     iv: iv.toString('hex'),
     authTag: cipher.getAuthTag().toString('hex'),
-  };
+  }
 }
 
 /**
@@ -78,14 +90,45 @@ function encryptSecret(secret: string): { encrypted: string; iv: string; authTag
  * Throws if decryption fails.
  */
 function decryptSecret(encrypted: string, iv: string, authTag: string): string {
-  const key = Buffer.from(getEncryptionKey(), 'hex');
-  const decipher = crypto.createDecipheriv(ALGORITHM, key, Buffer.from(iv, 'hex'));
-  decipher.setAuthTag(Buffer.from(authTag, 'hex'));
+  const key = Buffer.from(getEncryptionKey(), 'hex')
+  const decipher = crypto.createDecipheriv(
+    ALGORITHM,
+    key,
+    Buffer.from(iv, 'hex')
+  )
+  decipher.setAuthTag(Buffer.from(authTag, 'hex'))
 
-  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+  decrypted += decipher.final('utf8')
 
-  return decrypted;
+  return decrypted
+}
+
+/**
+ * Decrypt a secret with an explicit key (not read from env). Used by the
+ * row-provenance read path to decrypt with whichever key an environment's
+ * WALLET_ENCRYPTION_KEY / WALLET_ENCRYPTION_KEY_OLD is proven (by hash) to
+ * match a row's recorded encryptionKeyId, and by rotation/backfill tooling.
+ */
+export function decryptSecretWithKey(
+  encrypted: string,
+  iv: string,
+  authTag: string,
+  keyHex: string
+): string {
+  assertValidHexKey(keyHex, 'Key')
+  const key = Buffer.from(keyHex, 'hex')
+  const decipher = crypto.createDecipheriv(
+    ALGORITHM,
+    key,
+    Buffer.from(iv, 'hex')
+  )
+  decipher.setAuthTag(Buffer.from(authTag, 'hex'))
+
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+  decrypted += decipher.final('utf8')
+
+  return decrypted
 }
 
 /**
@@ -103,36 +146,112 @@ function decryptSecretDualKey(
 ): { secret: string; keyUsed: 'primary' | 'fallback' } {
   // Try primary key
   try {
-    const key = Buffer.from(getEncryptionKey(), 'hex');
-    const decipher = crypto.createDecipheriv(ALGORITHM, key, Buffer.from(iv, 'hex'));
-    decipher.setAuthTag(Buffer.from(authTag, 'hex'));
+    const key = Buffer.from(getEncryptionKey(), 'hex')
+    const decipher = crypto.createDecipheriv(
+      ALGORITHM,
+      key,
+      Buffer.from(iv, 'hex')
+    )
+    decipher.setAuthTag(Buffer.from(authTag, 'hex'))
 
-    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+    decrypted += decipher.final('utf8')
 
-    return { secret: decrypted, keyUsed: 'primary' };
+    return { secret: decrypted, keyUsed: 'primary' }
   } catch (err) {
     // Try fallback key if available
-    const fallbackKey = getFallbackEncryptionKey();
+    const fallbackKey = getFallbackEncryptionKey()
     if (!fallbackKey) {
-      throw new Error(`Decryption with primary key failed: ${err instanceof Error ? err.message : 'unknown error'}`);
+      throw new Error(
+        `Decryption with primary key failed: ${err instanceof Error ? err.message : 'unknown error'}`
+      )
     }
 
     try {
-      const key = Buffer.from(fallbackKey, 'hex');
-      const decipher = crypto.createDecipheriv(ALGORITHM, key, Buffer.from(iv, 'hex'));
-      decipher.setAuthTag(Buffer.from(authTag, 'hex'));
+      const key = Buffer.from(fallbackKey, 'hex')
+      const decipher = crypto.createDecipheriv(
+        ALGORITHM,
+        key,
+        Buffer.from(iv, 'hex')
+      )
+      decipher.setAuthTag(Buffer.from(authTag, 'hex'))
 
-      let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-      decrypted += decipher.final('utf8');
+      let decrypted = decipher.update(encrypted, 'hex', 'utf8')
+      decrypted += decipher.final('utf8')
 
-      logger.info('[Wallet] Decrypted with fallback key; consider re-encrypting with primary key');
-      return { secret: decrypted, keyUsed: 'fallback' };
+      logger.info(
+        '[Wallet] Decrypted with fallback key; consider re-encrypting with primary key'
+      )
+      return { secret: decrypted, keyUsed: 'fallback' }
     } catch (fallbackErr) {
       throw new Error(
         `Decryption failed with both primary and fallback keys: ${fallbackErr instanceof Error ? fallbackErr.message : 'unknown error'}`
-      );
+      )
     }
+  }
+}
+
+/**
+ * Register the currently-configured active key (WALLET_ENCRYPTION_KEY) in the
+ * key registry, returning its registry row. Idempotent — looked up by hash,
+ * so repeated calls (every wallet creation/backfill) do not create duplicates.
+ */
+async function registerActiveKey() {
+  const keyHex = getEncryptionKey()
+  return getOrRegisterKey(keyHex, deriveBootstrapLabel(keyHex), 'ACTIVE')
+}
+
+/**
+ * Resolve the raw key material (hex) for a row's recorded encryptionKeyId by
+ * matching its registry hash against the key(s) actually available in this
+ * environment. Returns undefined if the row's key isn't registered, or if
+ * neither WALLET_ENCRYPTION_KEY nor WALLET_ENCRYPTION_KEY_OLD in this
+ * environment produces the recorded hash (operator must supply the right key).
+ */
+async function resolveKeyMaterialForRegistryId(
+  encryptionKeyId: string
+): Promise<string | undefined> {
+  const record = await db.walletEncryptionKey.findUnique({
+    where: { id: encryptionKeyId },
+  })
+  if (!record) return undefined
+
+  const candidates = [getEncryptionKey(), getFallbackEncryptionKey()].filter(
+    (k): k is string => Boolean(k)
+  )
+
+  return candidates.find((candidate) => hashKey(candidate) === record.hash)
+}
+
+/**
+ * Opportunistically record which key decrypted a legacy (encryptionKeyId ===
+ * null) row, so subsequent reads take the deterministic provenance path
+ * instead of the dual-key fallback heuristic. Best-effort: failures are
+ * logged, not thrown — provenance backfill must never break a read.
+ */
+async function backfillProvenance(
+  walletId: string,
+  keyUsed: 'primary' | 'fallback'
+): Promise<void> {
+  try {
+    const keyHex =
+      keyUsed === 'primary' ? getEncryptionKey() : getFallbackEncryptionKey()
+    if (!keyHex) return
+
+    const registryKey = await getOrRegisterKey(
+      keyHex,
+      deriveBootstrapLabel(keyHex),
+      keyUsed === 'primary' ? 'ACTIVE' : 'RETIRED'
+    )
+
+    await db.custodialWallet.update({
+      where: { id: walletId },
+      data: { encryptionKeyId: registryKey.id },
+    })
+  } catch (err) {
+    logger.warn(
+      `[Wallet] Failed to backfill encryptionKeyId for wallet ${walletId}: ${err instanceof Error ? err.message : 'unknown error'}`
+    )
   }
 }
 
@@ -150,13 +269,14 @@ function decryptSecretDualKey(
  * key means wallets cannot be recovered.
  */
 export async function createCustodialWallet(userId: string) {
-  const existing = await db.custodialWallet.findUnique({ where: { userId } });
+  const existing = await db.custodialWallet.findUnique({ where: { userId } })
   if (existing) {
-    throw new Error(`Wallet already exists for user ${userId}`);
+    throw new Error(`Wallet already exists for user ${userId}`)
   }
 
-  const keypair = Keypair.random();
-  const { encrypted, iv, authTag } = encryptSecret(keypair.secret());
+  const keypair = Keypair.random()
+  const { encrypted, iv, authTag } = encryptSecret(keypair.secret())
+  const activeKey = await registerActiveKey()
 
   const wallet = await db.custodialWallet.create({
     data: {
@@ -165,51 +285,252 @@ export async function createCustodialWallet(userId: string) {
       encryptedSecret: encrypted,
       iv,
       authTag,
+      keyVersion: 2,
+      encryptionKeyId: activeKey.id,
     },
-  });
+  })
 
-  logger.info(`[Wallet] Created for user ${userId}: ${wallet.publicKey}`);
-  return wallet;
+  logger.info(`[Wallet] Created for user ${userId}: ${wallet.publicKey}`)
+
+  // #339: Sponsored reserves — platform pays base reserve via outbox (durable, retriable)
+  if (process.env.SPONSORED_RESERVES_ENABLED !== 'false') {
+    // fire-and-forget: wallet creation succeeds even if sponsorship enqueue fails;
+    // reconciliation job will flag drift.
+    void provisionSponsoredAccount(wallet).catch((err) => {
+      logger.warn(
+        '[Wallet] Sponsored provision failed (wallet still created)',
+        {
+          userId,
+          publicKey: wallet.publicKey,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      )
+    })
+  }
+
+  return wallet
+}
+
+async function provisionSponsoredAccount(wallet: {
+  id: string
+  publicKey: string
+}) {
+  const { enqueueOutboxOp } = await import('../outbox/service')
+  const { deriveIdempotencyKey } = await import('../outbox/idempotency')
+  const { dispatchInBackground } = await import('../outbox/dispatcher')
+  const { alertingService } = await import('../services/alerting')
+
+  let sponsor: Keypair
+  try {
+    sponsor = await pickSponsor()
+  } catch (err) {
+    if (err instanceof SponsorCapacityExhaustedError) {
+      logger.error('[Wallet] Sponsor capacity exhausted', {
+        walletId: wallet.id,
+        publicKey: wallet.publicKey,
+      })
+      await alertingService
+        .emit(
+          {
+            title: 'Sponsor capacity exhausted',
+            description: `No sponsor account above SPONSOR_MIN_XLM_FLOOR for wallet ${wallet.publicKey}. Provisioning degraded.`,
+            severity: 'critical',
+            component: 'sponsor-pool',
+            metadata: { walletId: wallet.id },
+          },
+          'sponsor:capacity-exhausted'
+        )
+        .catch(() => {})
+      throw err
+    }
+    throw err
+  }
+
+  const ledgerKey = `${wallet.publicKey}:ACCOUNT`
+  const xlmReserved = '1'
+
+  // Idempotent: one row per wallet sponsorship attempt
+  const idempotencyKey = deriveIdempotencyKey(
+    'ACCOUNT_PROVISION',
+    wallet.id,
+    wallet.publicKey
+  )
+
+  await db.$transaction(async (tx) => {
+    const op = await enqueueOutboxOp(tx as any, {
+      idempotencyKey,
+      userId: wallet.id, // sponsoredId stored as userId for outbox scoping; admin can list by kind
+      kind: 'ACCOUNT_PROVISION' as any,
+      actor: 'SYSTEM' as any,
+      payload: {
+        method: 'sponsor_create_account',
+        sponsoredId: wallet.id,
+        sponsorAccount: sponsor.publicKey(),
+        newAccountId: wallet.publicKey,
+        ledgerKey,
+        xlmReserved,
+      } as any,
+    })
+
+    // Only dispatch if newly created; enqueue is idempotent
+    dispatchInBackground(op.id)
+  })
+}
+
+/**
+ * Sponsored trustline — call before first deposit of a new classic asset.
+ * No-op if SPONSORED_RESERVES_ENABLED is false or asset is Soroban (C...).
+ */
+export async function ensureSponsoredTrustline(
+  wallet: { id: string; publicKey: string },
+  assetCode: string,
+  assetIssuer: string
+): Promise<void> {
+  if (process.env.SPONSORED_RESERVES_ENABLED === 'false') return
+  if (!assetIssuer || assetIssuer.startsWith('C')) return
+
+  const ledgerKey = `${wallet.publicKey}:TRUSTLINE:${assetCode}:${assetIssuer}`
+  const existing = await (db as any).reserveSponsorship.findFirst({
+    where: { sponsoredId: wallet.id, ledgerKey, status: 'ACTIVE' },
+  })
+  if (existing) return
+
+  const { enqueueOutboxOp } = await import('../outbox/service')
+  const { deriveIdempotencyKey } = await import('../outbox/idempotency')
+  const { dispatchInBackground } = await import('../outbox/dispatcher')
+
+  let sponsor: Keypair
+  try {
+    sponsor = await pickSponsor()
+  } catch (err) {
+    if (err instanceof SponsorCapacityExhaustedError) throw err
+    throw err
+  }
+
+  const idempotencyKey = deriveIdempotencyKey(
+    'ACCOUNT_PROVISION',
+    wallet.id,
+    ledgerKey
+  )
+
+  await db.$transaction(async (tx) => {
+    const op = await enqueueOutboxOp(tx as any, {
+      idempotencyKey,
+      userId: wallet.id,
+      kind: 'ACCOUNT_PROVISION' as any,
+      actor: 'SYSTEM' as any,
+      payload: {
+        method: 'sponsor_trustline',
+        sponsoredId: wallet.id,
+        sponsorAccount: sponsor.publicKey(),
+        accountId: wallet.publicKey,
+        assetCode,
+        assetIssuer,
+        ledgerKey,
+        xlmReserved: '0.5',
+      } as any,
+    })
+    dispatchInBackground(op.id)
+  })
 }
 
 /**
  * Get wallet record by user ID.
  */
 export async function getWalletByUserId(userId: string) {
-  return db.custodialWallet.findUnique({ where: { userId } });
+  return db.custodialWallet.findUnique({ where: { userId } })
 }
 
 /**
  * Decrypt and return the Stellar Keypair for a user.
- * Supports dual-key reads if WALLET_ENCRYPTION_KEY_OLD is configured.
+ *
+ * Rows with a recorded `encryptionKeyId` (#323) take a deterministic path:
+ * look up which key encrypted this row, decrypt with exactly that key. Rows
+ * without one (written before provenance tracking existed) fall back to the
+ * legacy try-primary-then-fallback heuristic as a compatibility shim, and
+ * opportunistically backfill `encryptionKeyId` so subsequent reads take the
+ * deterministic path.
  */
 export async function getKeypairForUser(userId: string): Promise<Keypair> {
-  const wallet = await getWalletByUserId(userId);
+  const wallet = await getWalletByUserId(userId)
 
   if (!wallet) {
-    throw new Error(`No wallet found for user ${userId}`);
+    throw new Error(`No wallet found for user ${userId}`)
   }
 
-  // Use dual-key decryption for smooth key rotation support
+  if (wallet.encryptionKeyId) {
+    const keyHex = await resolveKeyMaterialForRegistryId(wallet.encryptionKeyId)
+    if (!keyHex) {
+      throw new Error(
+        `[Wallet] No key material available in this environment for user ${userId}'s ` +
+          `recorded encryption key (registry id ${wallet.encryptionKeyId}). Configure ` +
+          `WALLET_ENCRYPTION_KEY / WALLET_ENCRYPTION_KEY_OLD to match the key that encrypted this row.`
+      )
+    }
+
+    const secret = decryptSecretWithKey(
+      wallet.encryptedSecret,
+      wallet.iv,
+      wallet.authTag,
+      keyHex
+    )
+    return Keypair.fromSecret(secret)
+  }
+
+  // Legacy row with no recorded provenance: compatibility shim only.
   const { secret, keyUsed } = decryptSecretDualKey(
     wallet.encryptedSecret,
     wallet.iv,
     wallet.authTag
-  );
+  )
 
   if (keyUsed === 'fallback') {
-    logger.debug(`[Wallet] User ${userId} decrypted with fallback key; schedule re-encryption`);
+    logger.debug(
+      `[Wallet] User ${userId} decrypted with fallback key; schedule re-encryption`
+    )
   }
 
-  return Keypair.fromSecret(secret);
+  // Lazy re-encryption for wallets on v1 — this rewrites the ciphertext under
+  // the active key, so provenance can be set directly rather than backfilled.
+  if (wallet.keyVersion === 1) {
+    try {
+      const { encrypted, iv, authTag } = encryptSecret(secret)
+      const activeKey = await registerActiveKey()
+      await db.custodialWallet.update({
+        where: { id: wallet.id },
+        data: {
+          encryptedSecret: encrypted,
+          iv,
+          authTag,
+          keyVersion: 2,
+          encryptionKeyId: activeKey.id,
+        },
+      })
+      logger.info(
+        `[Wallet] Upgraded user ${userId} to keyVersion 2 via lazy re-encryption`
+      )
+    } catch (err) {
+      logger.error(
+        `[Wallet] Failed to lazy re-encrypt user ${userId}: ${err instanceof Error ? err.message : 'unknown error'}`
+      )
+      // Non-fatal, we still return the keypair
+    }
+  } else {
+    // v2 row, ciphertext untouched — just record which key it decrypted with.
+    await backfillProvenance(wallet.id, keyUsed)
+  }
+
+  return Keypair.fromSecret(secret)
 }
 
 /**
  * List all wallet public keys (for admin/debugging).
  */
 export async function listWallets(): Promise<string[]> {
-  const wallets = await db.custodialWallet.findMany({ select: { publicKey: true } });
-  return wallets.map(w => w.publicKey);
+  const wallets = await db.custodialWallet.findMany({
+    select: { publicKey: true },
+  })
+  return wallets.map((w) => w.publicKey)
 }
 
 /**
@@ -221,7 +542,7 @@ export function decryptSecretWithPrimaryKey(
   iv: string,
   authTag: string
 ): string {
-  return decryptSecret(encrypted, iv, authTag);
+  return decryptSecret(encrypted, iv, authTag)
 }
 
 /**
@@ -237,7 +558,7 @@ export function decryptSecretWithFallback(
   iv: string,
   authTag: string
 ): { secret: string; keyUsed: 'primary' | 'fallback' } {
-  return decryptSecretDualKey(encrypted, iv, authTag);
+  return decryptSecretDualKey(encrypted, iv, authTag)
 }
 
 /**
@@ -254,18 +575,18 @@ export function createEncryptedSecretWithKey(
   secret: string,
   keyHex: string
 ): { encrypted: string; iv: string; authTag: string } {
-  assertValidHexKey(keyHex, 'Key');
+  assertValidHexKey(keyHex, 'Key')
 
-  const key = Buffer.from(keyHex, 'hex');
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  const key = Buffer.from(keyHex, 'hex')
+  const iv = crypto.randomBytes(16)
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv)
 
-  let encrypted = cipher.update(secret, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
+  let encrypted = cipher.update(secret, 'utf8', 'hex')
+  encrypted += cipher.final('hex')
 
   return {
     encrypted,
     iv: iv.toString('hex'),
     authTag: cipher.getAuthTag().toString('hex'),
-  };
+  }
 }

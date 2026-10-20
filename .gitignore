@@ -1,5 +1,10 @@
 node_modules
 .env
+.env.*
+!.env.example
+!.env.development
+!.env.production
+!.env.test
 dist
 logs/
 postgres/
@@ -9,3 +14,5 @@ coverage/
 skills-lock.json
 CLAUDE.md
 plan.md
+tasks/
+fix.md

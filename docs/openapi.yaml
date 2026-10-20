@@ -1,663 +1,4533 @@
-openapi: 3.1.0
-
+openapi: '3.0.3'
 info:
-  title: NeuroWealth API
-  version: 1.0.0
+  title: NeuroWealth Backend API
+  version: '1.0.0'
   description: |
-    REST API for the NeuroWealth platform — AI-assisted portfolio management
-    backed by Stellar smart contracts.
+    NeuroWealth autonomous DeFi portfolio manager backend.
 
-    **Breaking-change policy:** This API follows semantic versioning. Breaking
-    changes (removed fields, changed response shapes, new required params)
-    increment the major version and are announced in CHANGELOG.md at least two
-    weeks before release.
+    Authentication: All protected endpoints require a `Bearer <JWT>` token in the
+    `Authorization` header, obtained from `POST /api/auth/login`.
 
 servers:
-  - url: http://localhost:{port}
-    description: Local development
-    variables:
-      port:
-        default: '3000'
-  - url: https://api.neurowealth.app
-    description: Production
+  - url: /api/v1
+    description: Versioned API base (alias of /api for current release)
+  - url: /api
+    description: API base
 
 tags:
-  - name: health
-    description: Liveness and readiness probes
-  - name: auth
-    description: Wallet-based authentication (Stellar SIWE challenge/verify)
-  - name: portfolio
-    description: Portfolio positions, performance, and NLP queries
-  - name: transactions
-    description: Transaction history and details
-  - name: deposit
-    description: Deposit flows
-  - name: withdraw
-    description: Withdrawal flows
-  - name: vault
-    description: Vault / savings product
-  - name: admin
-    description: Admin-only management endpoints
+  - name: Network
+    description: Stellar network fee oracle and congestion (public).
+  - name: Analytics
+    description: Portfolio performance and risk analytics
+  - name: TwoFactorAuth
+    description: TOTP-based two-factor authentication enrollment and login verification (#2FA)
+  - name: Assistant
+    description: |
+      Tool-calling conversational assistant (#318). Replaces the rule-based
+      NLP parser as the recognition layer for open-ended requests. The model
+      never moves money or changes state directly — it may only propose a
+      call from a fixed, allowlisted tool registry, and every non-read-only
+      tool is dry-run and gated behind an explicit confirmation before it
+      executes through the same verified, idempotent, audited service paths
+      every other feature uses.
+  - name: Agent
+    description: Explainable rebalance decisions (#343) — the per-decision rationale ledger.
+  - name: Admin
+    description: Operational tooling and audit (requires admin-scoped credentials).
+  - name: Auth
+    description: Authentication and session management
+  - name: Portfolio
+    description: User portfolio management
+  - name: Realtime
+    description: |
+      Authenticated WebSocket streaming (#316). The handshake below is a real
+      HTTP request and is spec'd here so generated clients know how to open it;
+      everything after the 101 is the JSON subprotocol described in the
+      `WebSocket*` schemas and in docs/WEBSOCKET_STREAMING.md.
+  - name: Alerts
+    description: Alert rules and monitoring triggers (#366)
+  - name: Webhooks
+    description: User-scoped outbound webhook endpoints (#368)
+  - name: Net Worth
+    description: Owner-private net worth and read-only external Stellar wallet links (#540)
 
-# ── Security schemes ─────────────────────────────────────────────────────────
+# ─── Reusable components ──────────────────────────────────────────────────────
 components:
   securitySchemes:
-    BearerAuth:
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: Admin API key with the required resource scope
+    bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: JWT issued by `/api/auth/verify`. Include as `Authorization: Bearer <token>`.
-    AdminToken:
-      type: apiKey
-      in: header
-      name: X-Admin-Token
-      description: Static admin token set via `ADMIN_SECRET` env var. Required for all `/api/admin/*` routes.
-    InternalToken:
-      type: apiKey
-      in: header
-      name: X-Internal-Token
-      description: Service-to-service token for internal calls (e.g. Stellar event relayer).
 
-  # ── Reusable schemas ───────────────────────────────────────────────────────
   schemas:
-    ErrorResponse:
-      type: object
-      required: [error]
-      properties:
-        error:
-          type: string
-          example: Unauthorized
-        details:
-          description: Optional structured detail (array or object)
-          oneOf:
-            - type: array
-              items: {}
-            - type: object
+    # ── Shared primitives ────────────────────────────────────────────────────
+    Period:
+      type: string
+      enum: ['7d', '30d', '90d']
+      default: '30d'
+      description: Analysis time window. Maximum available history is 90 days.
 
-    HealthResponse:
+    InsufficientHistoryFlag:
+      type: boolean
+      description: |
+        True when the available snapshot history is shorter than the requested
+        window. Rows/responses with this flag set are excluded from leaderboard
+        rankings. Never silently serves a truncated window under the requested label.
+
+    PaginationMeta:
       type: object
-      required: [status, timestamp, version, environment]
+      required: [page, limit, total, totalPages, hasNext, hasPrevious]
       properties:
-        status:
+        page:
+          type: integer
+          minimum: 1
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+        total:
+          type: integer
+          minimum: 0
+        totalPages:
+          type: integer
+          minimum: 0
+        hasNext:
+          type: boolean
+        hasPrevious:
+          type: boolean
+
+    NullableDecimal:
+      type: number
+      format: double
+      nullable: true
+
+    TotpEnrollResponse:
+      type: object
+      required: [otpauthUri, secret, recoveryCodes]
+      properties:
+        otpauthUri:
           type: string
-          enum: [ok, degraded]
-        timestamp:
+          description: Standard otpauth:// URI for QR-code rendering.
+        secret:
+          type: string
+          description: Base32 TOTP secret. Returned only at enrollment; never re-exposed.
+        recoveryCodes:
+          type: array
+          items:
+            type: string
+          description: One-time backup codes. Returned only once at issuance; stored hashed.
+
+    TotpVerifyEnrollmentRequest:
+      type: object
+      required: [code]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          description: Six-digit code from the user's authenticator app.
+
+    TotpVerifyEnrollmentResponse:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+        verifiedAt:
           type: string
           format: date-time
-        version:
-          type: string
-          example: 1.0.0
-        environment:
-          type: string
-          enum: [development, test, production]
 
-    AuthChallengeResponse:
+    TotpLoginVerifyRequest:
       type: object
-      required: [nonce, expiresAt]
+      required: [challengeToken, code]
+      additionalProperties: false
       properties:
-        nonce:
+        challengeToken:
           type: string
-          description: Random one-time nonce the wallet must sign
-          example: a3f9e2c1d0b84756
-        expiresAt:
+          description: Opaque token returned by /auth/verify when requiresTotp is true.
+        code:
           type: string
-          format: date-time
+          description: Six-digit TOTP code or a one-time recovery code.
 
-    AuthVerifyRequest:
+    TotpLoginVerifyResponse:
       type: object
-      required: [publicKey, signature, nonce]
+      required: [accessToken, refreshToken]
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+
+    TotpDisableRequest:
+      type: object
+      required: [challenge, signature]
+      additionalProperties: false
+      properties:
+        challenge:
+          type: string
+          description: Fresh wallet-signature challenge issued for this disable operation.
+        signature:
+          type: string
+          description: Signature over the challenge proving control of the wallet.
+
+    TotpRegenerateRecoveryCodesResponse:
+      type: object
+      required: [recoveryCodes]
+      properties:
+        recoveryCodes:
+          type: array
+          items:
+            type: string
+          description: New one-time backup codes. All previous codes are invalidated.
+
+    ExternalWalletLinkRequest:
+      type: object
+      required: [publicKey, label]
+      additionalProperties: false
       properties:
         publicKey:
           type: string
-          description: Stellar G-address (Ed25519 public key)
-          example: GDQP2KPQGKIHYJGXNUIYOMHARUARCA7DJT5FO2FFOOKY3B2WSQHG4W37
-        signature:
+          description: Public Stellar G-address. Secret keys and signatures are never requested.
+        label:
           type: string
-          description: Base64-encoded signature over the nonce
-        nonce:
-          type: string
+          minLength: 1
+          maxLength: 60
 
-    AuthVerifyResponse:
+    ExternalWalletLinkResponse:
       type: object
-      required: [token]
-      properties:
-        token:
-          type: string
-          description: JWT for use in subsequent requests
-        expiresIn:
-          type: integer
-          description: Seconds until the token expires
-          example: 86400
-
-    Portfolio:
-      type: object
-      required: [address, totalValueUsdc, positions]
-      properties:
-        address:
-          type: string
-        totalValueUsdc:
-          type: string
-          description: Total portfolio value in USDC (string to avoid float precision loss)
-          example: '12450.75'
-        pnlPercent:
-          type: string
-          example: '4.23'
-        positions:
-          type: array
-          items:
-            $ref: '#/components/schemas/Position'
-
-    Position:
-      type: object
-      required: [asset, amount, valueUsdc]
-      properties:
-        asset:
-          type: string
-          example: XLM
-        amount:
-          type: string
-          example: '5000.0000000'
-        valueUsdc:
-          type: string
-          example: '600.00'
-        pnlPercent:
-          type: string
-
-    Transaction:
-      type: object
-      required: [id, type, amount, asset, status, createdAt]
+      required: [id, publicKey, label, verificationStatus, verified]
       properties:
         id:
           type: string
-        type:
+          format: uuid
+        publicKey:
           type: string
-          enum: [deposit, withdrawal, swap, vault_deposit, vault_withdraw]
+        label:
+          type: string
+        addedAt:
+          type: string
+          format: date-time
+        verificationStatus:
+          type: string
+          enum: [UNVERIFIED_SELF_REPORTED]
+        verified:
+          type: boolean
+          enum: [false]
+        notice:
+          type: string
+        lastSyncedAt:
+          type: string
+          format: date-time
+          nullable: true
+        stale:
+          type: boolean
+
+    NetWorthHolding:
+      type: object
+      required: [assetCode, amount, valueUsd, source]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Present for platform positions.
+        assetCode:
+          type: string
+        assetIssuer:
+          type: string
+          nullable: true
         amount:
           type: string
-        asset:
+          nullable: true
+          description: Exact token amount for external balances; null for platform position totals.
+        valueUsd:
+          type: number
+          nullable: true
+          description: Null when the external asset has no supported USD valuation.
+        source:
           type: string
+          enum: [platform, external]
+        walletId:
+          type: string
+          format: uuid
+        label:
+          type: string
+        verificationStatus:
+          type: string
+          enum: [UNVERIFIED_SELF_REPORTED]
+        asOf:
+          type: string
+          format: date-time
+          nullable: true
+        stale:
+          type: boolean
+
+    NetWorthResponse:
+      type: object
+      required:
+        [
+          currency,
+          totalKnownUsd,
+          platformValueUsd,
+          externalKnownValueUsd,
+          valuationComplete,
+          unpricedExternalHoldingCount,
+          staleWalletCount,
+          holdings,
+          externalWallets,
+        ]
+      properties:
+        currency:
+          type: string
+          enum: [USD]
+        totalKnownUsd:
+          type: number
+          description: Known subtotal; not a complete total when valuationComplete is false.
+        platformValueUsd:
+          type: number
+        externalKnownValueUsd:
+          type: number
+        valuationComplete:
+          type: boolean
+        unpricedExternalHoldingCount:
+          type: integer
+        staleWalletCount:
+          type: integer
+        holdings:
+          type: array
+          items:
+            $ref: '#/components/schemas/NetWorthHolding'
+        externalWallets:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExternalWalletNetWorth'
+
+    ExternalWalletNetWorth:
+      type: object
+      required:
+        [
+          id,
+          label,
+          publicKey,
+          verificationStatus,
+          verified,
+          addedAt,
+          lastSyncedAt,
+          stale,
+          syncFailed,
+          holdings,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        publicKey:
+          type: string
+        verificationStatus:
+          type: string
+          enum: [UNVERIFIED_SELF_REPORTED]
+        verified:
+          type: boolean
+          enum: [false]
+        addedAt:
+          type: string
+          format: date-time
+        lastSyncedAt:
+          type: string
+          format: date-time
+          nullable: true
+        stale:
+          type: boolean
+        syncFailed:
+          type: boolean
+        holdings:
+          type: array
+          items:
+            $ref: '#/components/schemas/NetWorthHolding'
+
+    GoalCreateRequest:
+      type: object
+      required: [targetAmount, targetDate]
+      properties:
+        targetAmount:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+        targetDate:
+          type: string
+          format: date-time
+        startingAmount:
+          type: number
+          minimum: 0
+        positionId:
+          type: string
+          format: uuid
+        riskCeiling:
+          type: integer
+          minimum: 0
+          maximum: 100
+        includeExternalHoldings:
+          type: boolean
+          default: false
+          description: Include known external issuer-matched USDC in this owner's private goal progress.
+
+    GoalUpdateRequest:
+      type: object
+      minProperties: 1
+      properties:
+        targetAmount:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+        targetDate:
+          type: string
+          format: date-time
+        riskCeiling:
+          type: integer
+          minimum: 0
+          maximum: 100
+        includeExternalHoldings:
+          type: boolean
+          description: Opt in or out of counting known external USDC in this owner's goal progress.
+
+    GoalProgressResponse:
+      type: object
+      required:
+        [
+          goalId,
+          status,
+          targetAmount,
+          startingAmount,
+          currentAmount,
+          targetDate,
+          requiredApy,
+          actualApy,
+          onTrack,
+          reachable,
+          projectedCompletionDate,
+          includeExternalHoldings,
+          externalStaleWalletCount,
+          unpricedExternalHoldingCount,
+        ]
+      properties:
+        goalId:
+          type: string
+          format: uuid
         status:
           type: string
-          enum: [pending, confirmed, failed]
-        stellarTxHash:
+        targetAmount:
+          type: number
+        startingAmount:
+          type: number
+        currentAmount:
+          type: number
+        targetDate:
           type: string
+          format: date-time
+        requiredApy:
+          type: number
+        actualApy:
+          type: number
+        onTrack:
+          type: boolean
+        reachable:
+          type: boolean
+        projectedCompletionDate:
+          type: string
+          format: date-time
+          nullable: true
+        includeExternalHoldings:
+          type: boolean
+        externalStaleWalletCount:
+          type: integer
+        unpricedExternalHoldingCount:
+          type: integer
+        note:
+          type: string
+          nullable: true
+
+    RankedCandidate:
+      type: object
+      required: [protocol, eligible]
+      properties:
+        protocol:
+          type: string
+        apy:
+          $ref: '#/components/schemas/NullableDecimal'
+        riskScore:
+          type: integer
+          nullable: true
+        eligible:
+          type: boolean
+        rejectionReason:
+          type: string
+          nullable: true
+          description: null on the chosen protocol; otherwise over_risk_ceiling | risk_score_unknown | lower_apy | lower_target_weight | current_position | etc.
+
+    RebalanceDecision:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        correlationId:
+          type: string
+        batchKey:
+          type: string
+        fromProtocol:
+          type: string
+        toProtocol:
+          type: string
+          nullable: true
+        outcome:
+          type: string
+          enum: [REBALANCED, HELD, BLOCKED]
+        blockedReason:
+          type: string
+          nullable: true
+          description: risk_ceiling | below_min_improvement | cost_exceeds_gain | no_candidates
+        strategyName:
+          type: string
+          nullable: true
+        strategyIsFollowed:
+          type: boolean
+        followedStrategyId:
+          type: string
+          format: uuid
+          nullable: true
+        thresholds:
+          type: object
+          properties:
+            minimumImprovement:
+              type: number
+            maxGasPercent:
+              type: number
+        currentApy:
+          $ref: '#/components/schemas/NullableDecimal'
+        chosenApy:
+          $ref: '#/components/schemas/NullableDecimal'
+        rawImprovement:
+          $ref: '#/components/schemas/NullableDecimal'
+        estCostPercent:
+          $ref: '#/components/schemas/NullableDecimal'
+        netImprovement:
+          $ref: '#/components/schemas/NullableDecimal'
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/RankedCandidate'
+        rationale:
+          type: string
+          nullable: true
+        outboxOpId:
+          type: string
+          format: uuid
+          nullable: true
+        outboxStatus:
+          type: string
+          nullable: true
+          description: Joined from outbox_ops.status when outboxOpId present.
+        heldSince:
+          type: string
+          format: date-time
+          nullable: true
+        lastEvaluatedAt:
+          type: string
+          format: date-time
+          nullable: true
         createdAt:
           type: string
           format: date-time
 
-    VaultPosition:
+    RebalanceDecisionAdmin:
+      allOf:
+        - $ref: '#/components/schemas/RebalanceDecision'
+        - type: object
+          properties:
+            affectedUserIds:
+              type: array
+              items:
+                type: string
+                format: uuid
+            affectedPositions:
+              type: integer
+
+    StressScenario:
       type: object
-      required: [balance, yieldEarned, lockUntil]
       properties:
-        balance:
+        id:
           type: string
-        yieldEarned:
+        label:
           type: string
-        lockUntil:
+        description:
+          type: string
+        shocks:
+          type: object
+        provenance:
+          type: string
+
+    StressResult:
+      type: object
+      properties:
+        scenarioId:
+          type: string
+        label:
+          type: string
+        preValueUsd:
+          type: number
+        postValueUsd:
+          type: number
+        impactUsd:
+          type: number
+        impactPct:
+          type: number
+        perPosition:
+          type: array
+          items:
+            type: object
+        modeledRecoveryDays:
+          type: integer
+          nullable: true
+        permanentImpairment:
+          type: boolean
+        caveat:
+          type: string
+        asOf:
+          type: string
+          format: date-time
+
+    # ── Assistant (#318) ─────────────────────────────────────────────────────
+    AssistantChatRequest:
+      type: object
+      required: [message]
+      additionalProperties: false
+      properties:
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        targetUserId:
+          type: string
+          format: uuid
+          description: |
+            Act on this linked sub-account instead of the caller's own
+            account. Omit (or pass the caller's own id) to act on the
+            caller's own account.
+
+    AssistantChatResponse:
+      type: object
+      required: [reply, usedFallback, pendingConfirmation]
+      properties:
+        reply:
+          type: string
+          description: The assistant's reply, ready to display verbatim.
+        usedFallback:
+          type: boolean
+          description: |
+            True when the model was unavailable or the token budget was
+            exhausted and this reply is a graceful degradation rather than a
+            model-generated answer.
+        pendingConfirmation:
+          type: boolean
+          description: |
+            True when this reply is a confirmation prompt for a proposed
+            action. The caller's next message on the same channel/account
+            must be an affirmative or negative reply — it is interpreted as
+            the confirmation decision, not a new request.
+
+    # ── Strategy What-If simulation (#344) ────────────────────────────────────
+    StrategySimulateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        strategy:
+          type: string
+          enum: [MAX_YIELD, TARGET_ALLOCATION, GOAL_TRACKING]
+          nullable: true
+          description: Strategy to simulate. Mutually exclusive with followStrategyId.
+        targetAllocations:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 100
+          description: |
+            Protocol name → target weight (%). After config resolution these
+            must sum to 100 for TARGET_ALLOCATION, enforced in the service.
+        riskCeiling:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: |
+            Risk ceiling to simulate. Always clamped to the stricter of the
+            caller's own and any applied ceiling.
+        followStrategyId:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Simulate the config of a published strategy to follow. Mutually
+            exclusive with the inline strategy/targetAllocations/riskCeiling.
+        historyWindowDays:
+          type: integer
+          minimum: 1
+          maximum: 180
+          default: 90
+          description: Historical replay window; capped at 180 days.
+        assumeInitialDeposit:
+          type: boolean
+          description: |
+            When the caller has no active positions, replay a nominal $1000
+            instead of zero.
+
+    StrategySimulateResponse:
+      type: object
+      required:
+        [
+          immediate,
+          historical,
+          simulationToken,
+          asOf,
+          effectiveConfig,
+          dataCaveats,
+          label,
+        ]
+      properties:
+        immediate:
+          $ref: '#/components/schemas/StrategyImmediateDecision'
+        historical:
+          $ref: '#/components/schemas/StrategyHistoricalReplay'
+        simulationToken:
+          type: string
+          description: Opaque sha-256 binding the preview to the exact config + window.
+        asOf:
+          type: string
+          format: date-time
+        effectiveConfig:
+          type: object
+          properties:
+            strategyName:
+              type: string
+              enum: [MAX_YIELD, TARGET_ALLOCATION, GOAL_TRACKING]
+              nullable: true
+            targetAllocations:
+              type: object
+              additionalProperties:
+                type: number
+            riskCeiling:
+              type: integer
+              nullable: true
+        dataCaveats:
+          type: array
+          items:
+            type: string
+          description: Window-truncation and missing-protocol caveats, never silent.
+        label:
+          type: string
+
+    StrategyImmediateDecision:
+      type: object
+      required: [action, targetProtocol, moves, trace, reasoning]
+      properties:
+        action:
+          type: string
+          enum: [rebalance, hold, blocked]
+        targetProtocol:
+          type: string
+          nullable: true
+        moves:
+          type: array
+          items:
+            type: object
+            properties:
+              toProtocol:
+                type: string
+              fraction:
+                type: number
+        trace:
+          type: object
+          description: Shape-parity with the persisted DecisionTrace.
+        reasoning:
+          type: string
+
+    StrategyHistoricalReplay:
+      type: object
+      required:
+        - rebalanceCount
+        - turnoverRatio
+        - totalFeesPaid
+        - endingValue
+        - startingValue
+        - counterfactualEndingValue
+        - finalProtocol
+        - timeSeries
+        - realizedGainPct
+        - counterfactualGainPct
+        - dataCaveats
+      properties:
+        rebalanceCount:
+          type: integer
+        turnoverRatio:
+          type: number
+        totalFeesPaid:
+          type: string
+        endingValue:
+          type: string
+        startingValue:
+          type: string
+        counterfactualEndingValue:
+          type: string
+        finalProtocol:
+          type: string
+          nullable: true
+        timeSeries:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              simulatedValue:
+                type: string
+              counterfactualValue:
+                type: string
+        realizedGainPct:
+          type: number
+          nullable: true
+        counterfactualGainPct:
+          type: number
+          nullable: true
+        dataCaveats:
+          type: array
+          items:
+            type: string
+
+    # ── Risk metrics ─────────────────────────────────────────────────────────
+    RiskMetrics:
+      type: object
+      description: |
+        Computed risk/performance statistics for a portfolio-value series.
+
+        **Null contract**: any metric that is not computable (insufficient samples,
+        zero variance, degenerate series) is returned as `null` — never as `0`,
+        `Infinity`, or `NaN`.
+
+        **VaR / CVaR estimators**:
+        - `varHistorical*` / `cvarHistorical*` — empirical (plain-historical),
+          sorts the observed return distribution. Preferred for DeFi portfolios.
+        - `varParametric*` — Gaussian assumption (mean + σ). Underestimates tail
+          risk for fat-tailed distributions; provided for comparison only.
+
+        All loss magnitudes are **positive numbers** (0.05 = 5% potential loss).
+      properties:
+        sampleCount:
+          type: integer
+          description: Number of period-return observations used in all computations.
+        annualisedVolatility:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: |
+            Sample standard deviation of period returns × √(periodsPerYear).
+            null if fewer than 2 return observations.
+        sortinoRatio:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: |
+            (Annualised mean return − MAR) / annualised downside deviation.
+            null if fewer than 2 observations or downside deviation is 0 (no losses).
+        downsideDeviation:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: RMS of returns below MAR, annualised. null if no returns.
+        maxDrawdown:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: |
+            Maximum peak-to-trough decline as a positive fraction (0.15 = 15%).
+            null if fewer than 2 value points.
+        maxDrawdownDuration:
+          nullable: true
+          type: integer
+          description: |
+            Number of observation steps from peak to trough in the max drawdown
+            episode. null if no drawdown occurred.
+        varHistorical95:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: Historical VaR at 95% confidence (positive = potential loss).
+        varHistorical99:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: Historical VaR at 99% confidence.
+        varParametric95:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: Parametric (Gaussian) VaR at 95% confidence.
+        varParametric99:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: Parametric (Gaussian) VaR at 99% confidence.
+        cvarHistorical95:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: Historical CVaR (Expected Shortfall) at 95%.
+        cvarHistorical99:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: Historical CVaR at 99%.
+        beta:
+          allOf:
+            - $ref: '#/components/schemas/NullableDecimal'
+          description: |
+            Beta vs an exogenous benchmark series. null when no benchmark is
+            provided (benchmark index ingestion is deferred).
+        periodsPerYear:
+          type: number
+          description: |
+            Inferred periods-per-year used for annualisation, derived from the
+            median inter-observation spacing. Robust to snapshot gaps.
+      required:
+        - sampleCount
+        - periodsPerYear
+
+    PortfolioRiskResponse:
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+        requestedWindow:
+          $ref: '#/components/schemas/Period'
+        actualWindowDays:
+          type: integer
+          description: Days of data actually used (may be shorter than requested).
+        insufficientHistory:
+          $ref: '#/components/schemas/InsufficientHistoryFlag'
+        dataFrom:
+          nullable: true
+          type: string
+          format: date-time
+          description: ISO timestamp of the earliest snapshot included.
+        dataTo:
+          nullable: true
+          type: string
+          format: date-time
+          description: ISO timestamp of the latest snapshot included.
+        computedAt:
+          type: string
+          format: date-time
+          description: When these figures were computed (staleness signal).
+        source:
+          type: string
+          enum: ['precomputed', 'live']
+          description: Whether the response was served from the precomputed cache.
+        metrics:
+          allOf:
+            - $ref: '#/components/schemas/RiskMetrics'
+            - nullable: true
+              type: object
+          description: null when sampleCount is 0 (entirely un-funded history).
+      required:
+        - userId
+        - requestedWindow
+        - actualWindowDays
+        - insufficientHistory
+        - computedAt
+        - source
+
+    RollingVolPoint:
+      type: object
+      properties:
+        timestampMs:
+          type: integer
+          format: int64
+          description: Epoch milliseconds of the last return in this rolling window.
+        volatility:
+          nullable: true
+          type: number
+          format: double
+          description: Annualised volatility over the window. null if insufficient data.
+      required:
+        - timestampMs
+        - volatility
+
+    DrawdownPoint:
+      type: object
+      properties:
+        timestampMs:
+          type: integer
+          format: int64
+        drawdown:
+          type: number
+          format: double
+          description: Drawdown from the running peak as a positive fraction.
+      required:
+        - timestampMs
+        - drawdown
+
+    TimeseriesResponse:
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+        requestedWindow:
+          $ref: '#/components/schemas/Period'
+        insufficientHistory:
+          $ref: '#/components/schemas/InsufficientHistoryFlag'
+        rollingVolatility:
+          type: array
+          items:
+            $ref: '#/components/schemas/RollingVolPoint'
+        drawdown:
+          type: array
+          items:
+            $ref: '#/components/schemas/DrawdownPoint'
+        computedAt:
+          type: string
+          format: date-time
+      required:
+        - userId
+        - requestedWindow
+        - insufficientHistory
+        - rollingVolatility
+        - drawdown
+        - computedAt
+
+    ErrorResponse:
+      type: object
+      description: |
+        Canonical error envelope returned by every 4xx/5xx response.
+        500 messages are always generic; use `requestId` (also sent as the
+        `X-Request-ID` header) to look the failure up in logs and traces.
+      properties:
+        status:
+          type: integer
+          description: HTTP status code
+          example: 404
+        code:
+          type: string
+          description: Machine-readable error code
+          example: NOT_FOUND
+        message:
+          type: string
+          description: Human-readable, sanitized message
+          example: Resource not found
+        error:
+          type: string
+          deprecated: true
+          description: Alias of `message`, kept for backward compatibility
+          example: Resource not found
+        details:
+          description: Optional structured context
+        requestId:
+          type: string
+          example: 550e8400-e29b-41d4-a716-446655440000
+        timestamp:
+          type: string
+          format: date-time
+      required:
+        - status
+        - code
+        - message
+        - error
+        - requestId
+        - timestamp
+
+    FieldError:
+      type: object
+      properties:
+        field:
+          type: string
+          example: amount
+        path:
+          type: string
+          deprecated: true
+          description: Alias of `field`
+          example: amount
+        message:
+          type: string
+          example: Number must be greater than 0
+      required:
+        - field
+        - message
+
+    ValidationError:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            status:
+              example: 400
+            code:
+              example: VALIDATION_ERROR
+            message:
+              example: Validation failed
+            details:
+              type: array
+              items:
+                $ref: '#/components/schemas/FieldError'
+
+    UnauthorizedError:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            status:
+              example: 401
+            code:
+              example: UNAUTHORIZED
+            message:
+              example: Unauthorized
+
+    # ── Real-time WebSocket subprotocol (#316) ───────────────────────────────
+    #
+    # These are not request/response bodies: they are the JSON frames exchanged
+    # over the socket opened by `GET /ws`. They live in the spec so client
+    # generators and reviewers have one authoritative shape per frame.
+
+    WebSocketTopic:
+      type: string
+      enum: [portfolio, transactions, agent, alerts, strategies]
+      description: |
+        Subscription, ordering, and permission unit.
+
+        **Ordering**: within a topic, events arrive in ascending `seq`. Across
+        topics there is NO ordering guarantee — all topics share one per-user
+        sequence, so use `seq` rather than arrival order. On-chain events
+        inherit ProcessedEvent's ledger ordering upstream.
+
+    WebSocketSubscribe:
+      type: object
+      description: Client → server. Start live delivery for the given topics.
+      required: [type, topics]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [subscribe]
+        topics:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/WebSocketTopic'
+        coalesce:
+          type: boolean
+          default: false
+          description: |
+            Opt into latest-wins coalescing of same-type bursts within a short
+            window (WS_COALESCE_WINDOW_MS). Suppressed events remain in the
+            durable stream but are NOT redelivered by a later `resume`, because
+            `afterSeq` has already moved past them. Off by default.
+
+    WebSocketResume:
+      type: object
+      description: |
+        Client → server. Replay everything after `afterSeq`, then switch to live.
+        Send this on every reconnect.
+      required: [type, topics, afterSeq]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [resume]
+        topics:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/WebSocketTopic'
+        afterSeq:
+          type: integer
+          minimum: 0
+          description: Last `seq` the client durably processed. 0 replays everything retained.
+        coalesce:
+          type: boolean
+          default: false
+
+    WebSocketUnsubscribe:
+      type: object
+      description: Client → server. Stop delivery for the given topics.
+      required: [type, topics]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [unsubscribe]
+        topics:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/WebSocketTopic'
+
+    WebSocketPing:
+      type: object
+      description: |
+        Client → server. Application-level keepalive, answered with `pong`. Only
+        needed by clients that cannot observe protocol-level pongs (browsers);
+        the server pings every `heartbeatIntervalMs` regardless.
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [ping]
+
+    WebSocketClientMessage:
+      description: |
+        Every message a client may send. The receive side is a control channel
+        only — v1 is server→client for data. State-changing operations stay on
+        the REST surface, which has the validation, idempotency, and audit trail
+        a socket does not.
+      oneOf:
+        - $ref: '#/components/schemas/WebSocketSubscribe'
+        - $ref: '#/components/schemas/WebSocketResume'
+        - $ref: '#/components/schemas/WebSocketUnsubscribe'
+        - $ref: '#/components/schemas/WebSocketPing'
+
+    WebSocketHello:
+      type: object
+      description: Server → client. First frame after a successful handshake.
+      required: [type, actor, topics, currentSeq, heartbeatIntervalMs]
+      properties:
+        type:
+          type: string
+          enum: [hello]
+        actor:
+          type: string
+          enum: [self, delegated]
+          description: |
+            `delegated` when the connection was opened with `?actor=<userId>`
+            and an ACTIVE sub-account grant authorised it.
+        topics:
+          type: array
+          description: Topics this connection may subscribe to, derived server-side.
+          items:
+            $ref: '#/components/schemas/WebSocketTopic'
+        currentSeq:
+          type: integer
+          description: Newest `seq` on the bound stream right now.
+        heartbeatIntervalMs:
+          type: integer
+
+    WebSocketSubscribed:
+      type: object
+      description: Server → client. Acknowledges the active subscription set.
+      required: [type, topics, currentSeq, coalesce]
+      properties:
+        type:
+          type: string
+          enum: [subscribed]
+        topics:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebSocketTopic'
+        currentSeq:
+          type: integer
+        coalesce:
+          type: boolean
+
+    WebSocketEvent:
+      type: object
+      description: |
+        Server → client. One domain event.
+
+        **Delivery is at-least-once.** A `resume` replays from the durable store
+        while live events keep arriving, and the live-switch prefers a duplicate
+        over a hole. Dedupe on `seq`, which is monotonic per user.
+
+        **Payloads are allowlisted per event type** by the same discipline as
+        REST responses (src/utils/api-formatters.ts). No `userId`, wallet
+        address, key, or internal field appears here.
+      required: [type, seq, topic, event, payload, emittedAt]
+      properties:
+        type:
+          type: string
+          enum: [event]
+        seq:
+          type: integer
+          description: Monotonic per-user sequence number. Track the highest you processed.
+        topic:
+          $ref: '#/components/schemas/WebSocketTopic'
+        event:
+          type: string
+          description: Domain event type, e.g. `deposit.received`.
+          example: deposit.received
+        payload:
+          type: object
+          additionalProperties: true
+        emittedAt:
+          type: string
+          format: date-time
+
+    WebSocketReplay:
+      type: object
+      description: Server → client. Brackets the replay served for a `resume`.
+      required: [type, status, fromSeq, toSeq, count]
+      properties:
+        type:
+          type: string
+          enum: [replay]
+        status:
+          type: string
+          enum: [start, end]
+        fromSeq:
+          type: integer
+        toSeq:
+          type: integer
+        count:
+          type: integer
+
+    WebSocketGap:
+      type: object
+      description: |
+        Server → client. The stream could not be served continuously.
+
+        * `retention` — the requested `afterSeq` is older than what is retained,
+          or a single replay hit its page limit with history still to come.
+        * `backpressure` — the client was too slow; delivery stopped at
+          `afterSeq`. Nothing is lost; `resume` from there.
+        * `unknown_stream` — the requested `afterSeq` is ahead of the server.
+
+        When `snapshotRequired` is true, replay cannot close the gap: fetch a
+        REST snapshot (`/portfolio`, `/transactions`, …) and then `subscribe`.
+      required:
+        [
+          type,
+          reason,
+          afterSeq,
+          currentSeq,
+          oldestAvailableSeq,
+          snapshotRequired,
+        ]
+      properties:
+        type:
+          type: string
+          enum: [gap]
+        reason:
+          type: string
+          enum: [retention, backpressure, unknown_stream]
+        afterSeq:
+          type: integer
+          nullable: true
+        currentSeq:
+          type: integer
+        oldestAvailableSeq:
+          type: integer
+          nullable: true
+        snapshotRequired:
+          type: boolean
+
+    WebSocketError:
+      type: object
+      description: |
+        Server → client. `forbidden` mirrors REST 403 semantics — a topic the
+        connection's grant does not cover. `unauthorized` precedes a close with
+        code 4408 when the session is revoked mid-connection.
+      required: [type, code, message]
+      properties:
+        type:
+          type: string
+          enum: [error]
+        code:
+          type: string
+          enum: [bad_request, forbidden, unauthorized, rate_limited, internal]
+        message:
+          type: string
+
+    WebSocketDraining:
+      type: object
+      description: |
+        Server → client. Sent before a graceful shutdown closes the socket with
+        code 1001. Reconnect after `retryAfterMs` and `resume` from
+        `resumeAfterSeq`.
+      required: [type, reason, resumeAfterSeq, retryAfterMs]
+      properties:
+        type:
+          type: string
+          enum: [draining]
+        reason:
+          type: string
+          enum: [server_shutdown]
+        resumeAfterSeq:
+          type: integer
+        retryAfterMs:
+          type: integer
+
+    WebSocketPong:
+      type: object
+      description: Server → client. Reply to an application-level `ping`.
+      required: [type, at]
+      properties:
+        type:
+          type: string
+          enum: [pong]
+        at:
+          type: string
+          format: date-time
+
+    WebSocketServerFrame:
+      description: Every frame the server may send.
+      oneOf:
+        - $ref: '#/components/schemas/WebSocketHello'
+        - $ref: '#/components/schemas/WebSocketSubscribed'
+        - $ref: '#/components/schemas/WebSocketEvent'
+        - $ref: '#/components/schemas/WebSocketReplay'
+        - $ref: '#/components/schemas/WebSocketGap'
+        - $ref: '#/components/schemas/WebSocketError'
+        - $ref: '#/components/schemas/WebSocketDraining'
+        - $ref: '#/components/schemas/WebSocketPong'
+
+    AlertRule:
+      type: object
+      description: Alert rule for monitoring portfolio metrics and protocol APY.
+      required:
+        [
+          id,
+          userId,
+          metric,
+          comparator,
+          threshold,
+          deliveryChannel,
+          isActive,
+          createdAt,
+          updatedAt,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique alert rule ID.
+        userId:
+          type: string
+          description: Owner of the alert rule.
+        metric:
+          type: string
+          enum: [PROTOCOL_APY, PORTFOLIO_VALUE]
+          description: Metric to monitor.
+        protocolName:
+          type: string
+          nullable: true
+          description: Protocol name for PROTOCOL_APY metrics; null for portfolio-level metrics.
+        comparator:
+          type: string
+          enum: [LT, GT, EQ]
+          description: Comparison operator for the threshold.
+        threshold:
+          type: string
+          description: Threshold value as a decimal string to avoid float precision loss.
+        deliveryChannel:
+          type: string
+          enum: [WEBHOOK, TELEGRAM, WHATSAPP, EMAIL]
+          description: Notification delivery channel.
+        cooldownMinutes:
+          type: integer
+          description: Minimum minutes between alert fires for the same rule.
+        lastFiredAt:
           type: string
           format: date-time
           nullable: true
+          description: Timestamp of last alert fire.
+        isActive:
+          type: boolean
+          description: Whether the alert rule is enabled.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+    UserWebhookEndpoint:
+      type: object
+      description: User-scoped outbound webhook endpoint for real-time event delivery.
+      required: [id, userId, url, events, isActive, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique endpoint ID.
+        userId:
+          type: string
+          description: Owner of the webhook endpoint.
+        url:
+          type: string
+          format: uri
+          description: HTTPS callback URL (must not be localhost or private IP).
+        events:
+          type: array
+          items:
+            type: string
+          description: Event types to subscribe to (e.g., "transaction.completed", "rebalance.executed").
+        topicScope:
+          type: string
+          nullable: true
+          description: Optional topic filter for event scope.
+        filterJson:
+          type: object
+          nullable: true
+          description: Optional JSON filter for matching events.
+        isActive:
+          type: boolean
+          description: Whether the endpoint is enabled.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UnauthorizedError'
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
 paths:
-
-  # ── Health ─────────────────────────────────────────────────────────────────
-  /health:
-    get:
-      tags: [health]
-      operationId: healthCheck
-      summary: Liveness check
-      description: Returns service status, version, and environment. No auth required.
+  /sub-accounts/bulk:
+    post:
+      tags:
+        - Auth
+      operationId: bulkSubAccountManagement
+      summary: Sequential, individually authorized sub-account operations with partial results or atomic rollback
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                atomic:
+                  type: boolean
+                  default: false
+                operations:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    required:
+                      - action
+                    properties:
+                      action:
+                        type: string
+                        enum:
+                          - create
+                          - update
+                          - setPermission
+                          - setLimit
+                          - revoke
+                      childUserId: &ref_0
+                        type: string
+                        format: uuid
+                      subAccountId: *ref_0
+                      payload:
+                        type: object
+                        properties:
+                          permissions:
+                            type: array
+                            minItems: 1
+                            maxItems: 4
+                            items:
+                              type: string
+                              enum:
+                                - VIEW
+                                - DEPOSIT
+                                - WITHDRAW
+                                - REBALANCE
+                          dailyLimit: &ref_1
+                            type: number
+                            minimum: 0
+                            exclusiveMinimum: true
+                            nullable: true
+                          transactionLimit: *ref_1
+              required:
+                - operations
       responses:
         '200':
-          description: Service is healthy
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
-
-  /health/ready:
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+      description: Create requires childUserId and nonempty permissions. Other actions require exactly one target and action-specific payload. Invalid rows fail independently by default. Atomic errors include failedIndex, rolledBack and per-row rollback/skipped results. SUB_ACCOUNT_MAX_BATCH_SIZE can lower the default 100-row limit.
+  /sub-accounts/summary:
     get:
-      tags: [health]
-      operationId: readinessCheck
-      summary: Readiness check
-      description: Returns 200 when DB and Stellar RPC are reachable, 503 otherwise.
+      tags:
+        - Auth
+      operationId: subAccountSummary
+      summary: Summarize owned children, permissions, daily-limit exposure, unlimited limits and 30-day activity
+      security:
+        - bearerAuth: []
       responses:
         '200':
-          description: All dependencies reachable
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
-        '503':
-          description: One or more dependencies unavailable
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  # ── Auth ───────────────────────────────────────────────────────────────────
-  /api/auth/challenge:
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /sub-accounts/{id}/limits:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: *ref_0
+    patch:
+      tags:
+        - Auth
+      operationId: updateSubAccountLimits
+      summary: Update owned child limits using the same primitive as bulk setLimit
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dailyLimit: *ref_1
+                transactionLimit: *ref_1
+              required: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /auth/webauthn/register-options:
+    post:
+      tags:
+        - Auth
+      operationId: webAuthnRegisterOptions
+      summary: Generate registration options from an active wallet-established session
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                deviceLabel:
+                  type: string
+                  maxLength: 100
+              required: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /auth/webauthn/register-verify:
+    post:
+      tags:
+        - Auth
+      operationId: webAuthnRegisterVerify
+      summary: Verify attestation, RP, origin, session-bound challenge and user verification
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                challengeId: &ref_1
+                  type: string
+                  pattern: ^[A-Za-z0-9_-]+$
+                response: &ref_2
+                  type: object
+                  additionalProperties: true
+                  description: The complete navigator.credentials response serialized as WebAuthn JSON
+                deviceLabel:
+                  type: string
+                  maxLength: 100
+              required:
+                - challengeId
+                - response
+      responses:
+        '201':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /auth/webauthn/login-options:
+    post:
+      tags:
+        - Auth
+      operationId: webAuthnLoginOptions
+      summary: Generate account-specific or discoverable passkey login options
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId: &ref_0
+                  type: string
+                  format: uuid
+              required: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /auth/webauthn/login-verify:
+    post:
+      tags:
+        - Auth
+      operationId: webAuthnLoginVerify
+      summary: Verify single-use assertion and counter; issue a normal session or enrolled TOTP challenge
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId: *ref_0
+                challengeId: *ref_1
+                response: *ref_2
+              required:
+                - challengeId
+                - response
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /webauthn/credentials:
     get:
-      tags: [auth]
-      operationId: getAuthChallenge
-      summary: Request a sign-in challenge nonce
+      tags:
+        - Auth
+      operationId: webAuthnListCredentials
+      summary: List owner-scoped passkey metadata with an active session
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /webauthn/credentials/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: *ref_0
+    delete:
+      tags:
+        - Auth
+      operationId: webAuthnDeleteCredential
+      summary: Delete an owned passkey with an active session; wallet login remains available
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /support/tickets:
+    get:
+      tags:
+        - Auth
+      operationId: listSupportTickets
+      summary: List owned tickets excluding internal notes in the database query
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+    post:
+      tags:
+        - Auth
+      operationId: createSupportTicket
+      summary: Create a rate-limited support ticket
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subject:
+                  type: string
+                  minLength: 3
+                  maxLength: 200
+                category: &ref_1
+                  type: string
+                  enum:
+                    - ACCOUNT
+                    - TRANSACTION
+                    - TAX
+                    - TECHNICAL
+                    - OTHER
+                priority: &ref_3
+                  type: string
+                  enum:
+                    - LOW
+                    - MEDIUM
+                    - HIGH
+                    - URGENT
+                body:
+                  type: string
+                  minLength: 5
+                  maxLength: 5000
+                contextRef:
+                  type: string
+              required:
+                - subject
+                - category
+                - body
+      responses:
+        '201':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+        '429':
+          description: Creation rate limit exceeded
+  /support/tickets/{id}:
+    parameters:
+      - &ref_0
+        name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - Auth
+      operationId: getSupportTicket
+      summary: Read owned ticket and public message thread
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /support/tickets/{id}/reply:
+    parameters:
+      - *ref_0
+    post:
+      tags:
+        - Auth
+      operationId: replySupportTicket
+      summary: Append public reply; reopen a resolved ticket
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body: &ref_4
+                  type: string
+                  minLength: 1
+                  maxLength: 5000
+              required:
+                - body
+      responses:
+        '201':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /admin/referrals/fraud/queue:
+    get:
+      tags:
+        - Admin
+      operationId: adminReferralFraudQueue
+      summary: Paginated flagged referral conversions; filters score band, flag, date; requires referrals:read
+      security:
+        - adminAuth: []
       parameters:
-        - in: query
-          name: publicKey
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: scoreMin
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: scoreMax
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: flag
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: pageSize
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+  /admin/referrals/fraud/bulk-review:
+    post:
+      tags:
+        - Admin
+      operationId: adminReferralFraudBulkReview
+      summary: Bulk approve or reject flagged conversions with per-item audit log; requires referrals:write
+      security:
+        - adminAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+  /admin/referrals/fraud/calibration:
+    get:
+      tags:
+        - Admin
+      operationId: adminReferralFraudCalibration
+      summary: Monthly score distribution, false-positive rate and threshold suggestion; requires referrals:read
+      security:
+        - adminAuth: []
+      parameters:
+        - name: month
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+  /admin/risk-metadata:
+    get:
+      tags:
+        - Admin
+      operationId: adminListRiskMetadata
+      summary: List protocol risk metadata with stale flag; requires risk-metadata:read
+      security:
+        - adminAuth: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+  /admin/risk-metadata/{protocolName}:
+    put:
+      tags:
+        - Admin
+      operationId: adminUpsertRiskMetadata
+      summary: Create or update protocol risk metadata with history and audit log; requires risk-metadata:write
+      security:
+        - adminAuth: []
+      parameters:
+        - name: protocolName
+          in: path
           required: true
           schema:
             type: string
-          description: Stellar G-address requesting a nonce
-      responses:
-        '200':
-          description: Challenge nonce issued
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AuthChallengeResponse'
-        '400':
-          description: Invalid public key
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/auth/verify:
-    post:
-      tags: [auth]
-      operationId: verifyAuthSignature
-      summary: Verify wallet signature and issue JWT
       requestBody:
-        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/AuthVerifyRequest'
+              type: object
       responses:
         '200':
-          description: Signature valid — JWT issued
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AuthVerifyResponse'
+          description: Successful operation
+        '400':
+          description: Invalid request
         '401':
-          description: Invalid or expired signature
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/auth/logout:
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+  /admin/treasury/sweep/preview:
     post:
-      tags: [auth]
-      operationId: logout
-      summary: Invalidate the current JWT
+      tags:
+        - Admin
+      operationId: adminTreasurySweepPreview
+      summary: Dry run of treasury sweeps under current policies; writes nothing; requires treasury:read
       security:
-        - BearerAuth: []
+        - adminAuth: []
       responses:
         '200':
-          description: Session invalidated
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
+          description: Successful operation
+        '400':
+          description: Invalid request
         '401':
-          $ref: '#/components/responses/Unauthorized'
-
-  # ── Portfolio ──────────────────────────────────────────────────────────────
-  /api/portfolio:
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+  /admin/treasury/policies/{id}/enable:
+    post:
+      tags:
+        - Admin
+      operationId: adminTreasuryPolicyEnable
+      summary: Enable sweeps for a policy; body confirmation must be SWEEP; requires treasury:write
+      security:
+        - adminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+  /admin/support/tickets:
     get:
-      tags: [portfolio]
-      operationId: getPortfolio
-      summary: Get the authenticated user's portfolio
+      tags:
+        - Admin
+      operationId: adminListSupportTickets
+      summary: Filter support queue with SLA deadlines; requires support:read
       security:
-        - BearerAuth: []
+        - adminAuth: []
       responses:
         '200':
-          description: Portfolio data
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Portfolio'
+          description: Successful operation
+        '400':
+          description: Invalid request
         '401':
-          $ref: '#/components/responses/Unauthorized'
-
-  /api/portfolio/query:
-    post:
-      tags: [portfolio]
-      operationId: queryPortfolio
-      summary: Natural-language portfolio query (NLP)
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+      parameters:
+        - name: status
+          in: query
+          schema: &ref_2
+            type: string
+            enum:
+              - OPEN
+              - IN_PROGRESS
+              - AWAITING_USER
+              - RESOLVED
+              - CLOSED
+        - name: category
+          in: query
+          schema: *ref_1
+        - name: assignedTo
+          in: query
+          schema:
+            type: string
+            description: Admin identifier or unassigned
+        - name: slaBreached
+          in: query
+          schema:
+            type: boolean
+  /admin/support/tickets/{id}:
+    parameters:
+      - *ref_0
+    get:
+      tags:
+        - Admin
+      operationId: adminGetSupportTicket
+      summary: Read full thread including internal notes; requires support:read
       security:
-        - BearerAuth: []
+        - adminAuth: []
+      responses:
+        '200':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+    patch:
+      tags:
+        - Admin
+      operationId: adminUpdateSupportTicket
+      summary: Update status, priority and assignment with transactional audit; requires support:write
+      security:
+        - adminAuth: []
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [query]
               properties:
-                query:
+                status: *ref_2
+                priority: *ref_3
+                assignedTo:
                   type: string
-                  example: What is my XLM allocation?
+                  nullable: true
+              required: []
       responses:
         '200':
-          description: NLP answer
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+        '409':
+          description: Invalid state transition
+  /admin/support/tickets/{id}/reply:
+    parameters:
+      - *ref_0
+    post:
+      tags:
+        - Admin
+      operationId: adminReplySupportTicket
+      summary: Append public reply or internal note; requires support:write
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                body: *ref_4
+                internal:
+                  type: boolean
+                  default: false
+              required:
+                - body
+      responses:
+        '201':
+          description: Successful operation
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '404':
+          description: Resource not found
+  /recurring-withdrawals:
+    get:
+      tags: [Transactions]
+      operationId: listRecurringWithdrawals
+      summary: List the current user's recurring withdrawal plans
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Owner-scoped plans }
+        '401': { description: Active session required }
+    post:
+      tags: [Transactions]
+      operationId: createRecurringWithdrawal
+      summary: Schedule a confirmed recurring on-chain withdrawal
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, destinationAddress, assetSymbol, cadence, confirmed]
+              properties:
+                userId: { type: string, format: uuid }
+                destinationAddress: { type: string }
+                assetSymbol: { type: string }
+                amountMode: { type: string, enum: [FIXED, YIELD_ONLY, PERCENT_OF_BALANCE], default: FIXED }
+                amount: { type: number, minimum: 0, exclusiveMinimum: true }
+                percentage: { type: number, minimum: 0.01, maximum: 100 }
+                minAmount: { type: number, minimum: 0, exclusiveMinimum: true }
+                cadence: { type: string, enum: [WEEKLY, BIWEEKLY, MONTHLY] }
+                confirmed: { type: boolean, enum: [true] }
+      responses:
+        '201': { description: Plan created }
+        '400': { description: Invalid or unconfirmed schedule }
+        '401': { description: Active owner session required }
+  /recurring-withdrawals/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Transactions]
+      operationId: getRecurringWithdrawal
+      summary: Read an owner-scoped withdrawal plan
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Plan details }
+        '403': { description: Forbidden }
+        '404': { description: Plan not found }
+    patch:
+      tags: [Transactions]
+      operationId: updateRecurringWithdrawal
+      summary: Update or pause a plan; destination changes pause for review
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                destinationAddress: { type: string }
+                amountMode: { type: string, enum: [FIXED, YIELD_ONLY, PERCENT_OF_BALANCE] }
+                amount: { type: number, minimum: 0, exclusiveMinimum: true }
+                percentage: { type: number, minimum: 0.01, maximum: 100 }
+                cadence: { type: string, enum: [WEEKLY, BIWEEKLY, MONTHLY] }
+                minAmount: { type: number, minimum: 0, exclusiveMinimum: true }
+                status: { type: string, enum: [ACTIVE, PAUSED, CANCELLED] }
+      responses:
+        '200': { description: Updated plan }
+        '400': { description: Invalid update }
+        '403': { description: Forbidden }
+        '404': { description: Plan not found }
+    delete:
+      tags: [Transactions]
+      operationId: cancelRecurringWithdrawal
+      summary: Cancel a recurring withdrawal plan
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Plan cancelled }
+        '403': { description: Forbidden }
+        '404': { description: Plan not found }
+  /recurring-withdrawals/{id}/preview:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Transactions]
+      operationId: previewRecurringWithdrawal
+      summary: Preview amount, minimum, destination risk and goal conflicts
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Projected next occurrence without sending funds }
+        '403': { description: Forbidden }
+        '404': { description: Plan not found }
+  # ── TOTP two-factor authentication (#2FA) ─────────────────────────────────────
+
+  /2fa/enroll:
+    post:
+      operationId: enrollTotp
+      summary: Begin TOTP 2FA enrollment
+      description: |
+        Generates a new TOTP secret and returns the otpauth:// URI plus
+        one-time recovery codes. The credential is NOT active until confirmed
+        via /2fa/verify-enrollment with a valid code from the authenticator app.
+      tags: [TwoFactorAuth]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Enrollment secret and recovery codes (returned once).
           content:
             application/json:
               schema:
-                type: object
-                required: [answer]
-                properties:
-                  answer:
-                    type: string
+                $ref: '#/components/schemas/TotpEnrollResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  # ── Transactions ───────────────────────────────────────────────────────────
-  /api/transactions:
-    get:
-      tags: [transactions]
-      operationId: listTransactions
-      summary: List the authenticated user's transactions
+  /2fa/verify-enrollment:
+    post:
+      operationId: verifyTotpEnrollment
+      summary: Confirm TOTP 2FA enrollment
+      description: Confirms the enrollment with a code from the authenticator app and activates the credential.
+      tags: [TwoFactorAuth]
       security:
-        - BearerAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TotpVerifyEnrollmentRequest'
+      responses:
+        '200':
+          description: Enrollment confirmed and active.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TotpVerifyEnrollmentResponse'
+        '400':
+          description: Invalid or expired code.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /2fa/disable:
+    post:
+      operationId: disableTotp
+      summary: Disable TOTP 2FA
+      description: |
+        Disabling 2FA is a security downgrade and requires a fresh
+        wallet-signature challenge, not just an active session.
+      tags: [TwoFactorAuth]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TotpDisableRequest'
+      responses:
+        '204':
+          description: 2FA disabled.
+        '400':
+          description: Invalid challenge or signature.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /2fa/recovery-codes/regenerate:
+    post:
+      operationId: regenerateTotpRecoveryCodes
+      summary: Regenerate TOTP recovery codes
+      description: Issues a new set of one-time backup codes and invalidates all previous codes.
+      tags: [TwoFactorAuth]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: New recovery codes (returned once).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TotpRegenerateRecoveryCodesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/2fa/verify:
+    post:
+      operationId: verifyTotpLogin
+      summary: Complete login with TOTP second factor
+      description: |
+        Completes login when /auth/verify returned requiresTotp. Accepts a
+        valid TOTP code (±1 step tolerance, replay-protected) or a one-time
+        recovery code.
+      tags: [TwoFactorAuth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TotpLoginVerifyRequest'
+      responses:
+        '200':
+          description: Session issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TotpLoginVerifyResponse'
+        '400':
+          description: Invalid, expired, or already-used code.
+        '401':
+          description: Invalid or expired challenge token.
+
+  # ── Assistant endpoints (#318) ────────────────────────────────────────────────
+
+  /assistant/chat:
+    post:
+      operationId: assistantChat
+      summary: Send a message to the tool-calling assistant
+      description: |
+        Sends one message to the conversational assistant and returns its
+        reply. The assistant may read live account data to ground its answer,
+        or propose an action (deposit, withdraw, rebalance, adjust strategy,
+        follow/unfollow a marketplace strategy, create a recurring deposit,
+        create an alert rule) — action proposals are always previewed
+        (dry-run) and returned as a confirmation prompt; the SAME action only
+        executes once the caller's next message is an affirmative reply
+        (`pendingConfirmation: true` on this response). A negative reply
+        cancels it; anything else re-prompts without executing or dropping
+        the pending action.
+
+        **Sub-accounts**: pass `targetUserId` to act on a linked child
+        account. The caller must hold an ACTIVE `SubAccount` link with the
+        permission the specific proposed tool requires (same enforcement as
+        `src/middleware/subAccount.ts`); a caller with no link, or the wrong
+        permission, gets `403` before the message even reaches the model.
+
+        **Degradation**: if the model is unavailable or the caller's token
+        budget is exhausted, this still returns `200` with a graceful reply
+        and `usedFallback: true` — never a `5xx` or a hang.
+      tags: [Assistant]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssistantChatRequest'
+            examples:
+              read_only:
+                summary: Open-ended read request
+                value:
+                  message: "what's my portfolio worth right now?"
+              action_proposal:
+                summary: A request that proposes an action
+                value:
+                  message: 'withdraw 50 USDC'
+              sub_account:
+                summary: Acting on a linked sub-account
+                value:
+                  message: "what's the balance on my kid's account?"
+                  targetUserId: '3f8e1c2a-4b5d-6e7f-8a9b-0c1d2e3f4a5b'
+      responses:
+        '200':
+          description: The assistant's reply.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssistantChatResponse'
+              examples:
+                grounded_answer:
+                  summary: Grounded read-only answer
+                  value:
+                    reply: 'Your portfolio is currently worth 150.00 USDC.'
+                    usedFallback: false
+                    pendingConfirmation: false
+                confirmation_prompt:
+                  summary: Action proposed — awaiting confirmation
+                  value:
+                    reply: 'I''d like to: *Withdraw 50 USDC*. Reply "yes" to confirm or "no" to cancel.'
+                    usedFallback: false
+                    pendingConfirmation: true
+                degraded:
+                  summary: Model unavailable — graceful fallback
+                  value:
+                    reply: 'I''m having trouble understanding requests like that right now. Please try a specific command (e.g. "balance", "deposit 10"), or try again shortly.'
+                    usedFallback: true
+                    pendingConfirmation: false
+        '400':
+          description: Validation failed (empty/oversized message, malformed targetUserId).
+        '401':
+          description: Missing/invalid bearer token, or no permission on the requested sub-account.
+
+  # ── Strategy What-If simulation (#344) ─────────────────────────────────────
+
+  /strategies/simulate:
+    post:
+      operationId: simulateStrategy
+      summary: Dry-run a hypothetical strategy change (what-if)
+      description: |
+        Simulates a hypothetical strategy config on the caller's current
+        positions and public `ProtocolRate` history without applying it. Pure
+        read — **zero side effects** (no outbox/event/log/transaction/DB write).
+
+        Returns two legs:
+          * `immediate` — what the agent would do right now (`rebalance` /
+            `hold` / `blocked`) plus a `trace` shape-parity with the persisted
+            `DecisionTrace`.
+          * `historical` — a non-compounding daily replay over retained history,
+            side-by-side with a counterfactual "held in the starting protocol"
+            leg; rebalances subtract the live `estimateRebalanceCost`.
+
+        Resolution precedence: followed config (current follow or
+        `followStrategyId`) → submitted inline config → the caller's own config.
+        The effective risk ceiling is always the stricter of the caller's and
+        any applied ceiling. `followStrategyId` is mutually exclusive with an
+        inline `strategy`/`targetAllocations`/`riskCeiling`.
+      tags: [Strategy]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StrategySimulateRequest'
+            examples:
+              what_if:
+                summary: Inline what-if
+                value:
+                  strategy: MAX_YIELD
+                  riskCeiling: 70
+                  historyWindowDays: 90
+              follow_target:
+                summary: Simulate the config of a followed strategy
+                value:
+                  followStrategyId: cccccccc-cccc-4ccc-8ccc-cccccccccccc
+      responses:
+        '200':
+          description: The what-if preview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StrategySimulateResponse'
+        '400':
+          description: SimulationValidationError (weights do not sum to 100, GOAL_TRACKING without an active goal, window over cap, follow/inline conflict).
+        '401':
+          description: Missing/invalid bearer token.
+        '404':
+          description: SimulationNotFoundError (unknown owner or unpublished follow target).
+        '429':
+          description: Rate limited (simulateRateLimiter, 6 req/min).
+
+  # ── Risk endpoints ───────────────────────────────────────────────────────────
+
+  /analytics/risk:
+    get:
+      operationId: getPortfolioRisk
+      summary: Portfolio risk metrics
+      description: |
+        Returns VaR (95%/99%, historical and parametric), CVaR (95%/99%,
+        historical), Sortino ratio, downside deviation, max drawdown (+duration),
+        and annualised volatility for the authenticated user's portfolio.
+
+        **Ownership**: `userId` is taken from the JWT payload — you cannot read
+        another user's risk data via this endpoint.
+
+        **Retention boundary**: YieldSnapshot rows are hard-deleted after 90 days
+        by the snapshotter. Windows longer than the available history are
+        relabelled with `insufficientHistory: true` and `actualWindowDays` set to
+        the honest available span — never silently truncated.
+
+        **Caching**: If a precomputed row < 1 hour old exists, it is returned
+        directly (`source: "precomputed"`). Otherwise a live compute is performed
+        (`source: "live"`).
+
+        **Null contract**: metrics that cannot be computed return `null`, never
+        `0`, `Infinity`, or `NaN`.
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
       parameters:
-        - in: query
-          name: limit
+        - name: window
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Period'
+          description: Analysis time window.
+      responses:
+        '200':
+          description: Risk metrics for the authenticated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PortfolioRiskResponse'
+              examples:
+                sufficient_history:
+                  summary: User with 30d of data
+                  value:
+                    userId: '3f8e1c2a-4b5d-6e7f-8a9b-0c1d2e3f4a5b'
+                    requestedWindow: '30d'
+                    actualWindowDays: 30
+                    insufficientHistory: false
+                    dataFrom: '2026-07-21T00:00:00.000Z'
+                    dataTo: '2026-08-20T00:00:00.000Z'
+                    computedAt: '2026-08-20T12:00:00.000Z'
+                    source: 'precomputed'
+                    metrics:
+                      sampleCount: 720
+                      annualisedVolatility: 0.12
+                      sortinoRatio: 1.85
+                      downsideDeviation: 0.045
+                      maxDrawdown: 0.08
+                      maxDrawdownDuration: 14
+                      varHistorical95: 0.031
+                      varHistorical99: 0.065
+                      varParametric95: 0.028
+                      varParametric99: 0.044
+                      cvarHistorical95: 0.052
+                      cvarHistorical99: 0.078
+                      beta: null
+                      periodsPerYear: 8760
+                insufficient_history:
+                  summary: New user with < 7d data requesting 30d
+                  value:
+                    userId: '3f8e1c2a-4b5d-6e7f-8a9b-0c1d2e3f4a5b'
+                    requestedWindow: '30d'
+                    actualWindowDays: 3
+                    insufficientHistory: true
+                    dataFrom: '2026-08-17T00:00:00.000Z'
+                    dataTo: '2026-08-20T00:00:00.000Z'
+                    computedAt: '2026-08-20T12:00:00.000Z'
+                    source: 'live'
+                    metrics: null
+        '400':
+          description: Invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '401':
+          description: Missing or invalid JWT.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedError'
+        '500':
+          description: Internal server error.
+
+  /analytics/risk/timeseries:
+    get:
+      operationId: getPortfolioRiskTimeseries
+      summary: Portfolio risk timeseries (rolling volatility + drawdown)
+      description: |
+        Returns graph-ready rolling annualised volatility and running-peak
+        drawdown series for the authenticated user's portfolio.
+
+        **Ownership**: `userId` is taken from the JWT payload.
+
+        **Null in rolling volatility**: points with fewer observations than
+        `rollingWindow` have `volatility: null`.
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: window
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Period'
+        - name: rollingWindow
+          in: query
+          required: false
           schema:
             type: integer
-            default: 20
-            maximum: 100
-        - in: query
-          name: cursor
-          schema:
-            type: string
-          description: Pagination cursor (transaction ID)
-        - in: query
-          name: type
-          schema:
-            type: string
-            enum: [deposit, withdrawal, swap, vault_deposit, vault_withdraw]
+            minimum: 2
+            maximum: 30
+            default: 7
+          description: Number of observations per rolling volatility window.
       responses:
         '200':
-          description: Transaction list
+          description: Timeseries data for the authenticated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeseriesResponse'
+        '400':
+          description: Invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '401':
+          description: Missing or invalid JWT.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedError'
+        '500':
+          description: Internal server error.
+
+  # ── Existing analytics endpoints ─────────────────────────────────────────────
+
+  /analytics/correlation:
+    get:
+      operationId: getPortfolioCorrelation
+      summary: Portfolio APY correlation matrix and diversification score
+      description: |
+        Returns the per-protocol APY correlation matrix and a weighted
+        diversification score for the authenticated user's portfolio (#348).
+
+        Correlation is computed from historical quoted APY levels
+        (`ProtocolRate.supplyApy`), aligned to common days — it measures how
+        synchronously protocols' yields have moved, NOT asset-price correlation,
+        and does not model principal loss, depeg, or smart-contract failure. The
+        `caveat` field ships with every response.
+
+        `correlation[i][j]` is in [-1, 1]; degenerate (constant) series yield
+        `null` rather than 0. The diversification score is 0-100 (higher = more
+        diversified), `null` when fewer than 2 protocols have history.
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [30d, 60d, 90d]
+            default: 90d
+      responses:
+        '200':
+          description: Correlation matrix and diversification score.
           content:
             application/json:
               schema:
                 type: object
-                required: [data]
                 properties:
-                  data:
+                  userId:
+                    type: string
+                    format: uuid
+                  window:
+                    type: string
+                  computed:
+                    type: boolean
+                  observationCount:
+                    type: integer
+                  protocols:
                     type: array
                     items:
-                      $ref: '#/components/schemas/Transaction'
-                  nextCursor:
-                    type: string
+                      type: string
+                  correlation:
+                    type: array
+                    items:
+                      type: array
+                      items:
+                        type: number
+                        nullable: true
+                  averageCorrelation:
+                    type: number
                     nullable: true
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-
-  # ── Deposit ────────────────────────────────────────────────────────────────
-  /api/deposit:
-    post:
-      tags: [deposit]
-      operationId: initiateDeposit
-      summary: Initiate a deposit
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [asset, amount]
-              properties:
-                asset:
-                  type: string
-                  example: USDC
-                amount:
-                  type: string
-                  example: '100.0000000'
-      responses:
-        '201':
-          description: Deposit initiated
+                  diversificationScore:
+                    type: number
+                    nullable: true
+                  caveat:
+                    type: string
+        '400':
+          description: Invalid query parameters.
           content:
             application/json:
               schema:
-                type: object
-                required: [transaction]
-                properties:
-                  transaction:
-                    $ref: '#/components/schemas/Transaction'
-        '400':
-          $ref: '#/components/responses/BadRequest'
+                $ref: '#/components/schemas/ValidationError'
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  # ── Withdraw ───────────────────────────────────────────────────────────────
-  /api/withdraw:
-    post:
-      tags: [withdraw]
-      operationId: initiateWithdrawal
-      summary: Initiate a withdrawal
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [asset, amount, destinationAddress]
-              properties:
-                asset:
-                  type: string
-                  example: XLM
-                amount:
-                  type: string
-                  example: '50.0000000'
-                destinationAddress:
-                  type: string
-      responses:
-        '201':
-          description: Withdrawal initiated
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [transaction]
-                properties:
-                  transaction:
-                    $ref: '#/components/schemas/Transaction'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-
-  # ── Vault ──────────────────────────────────────────────────────────────────
-  /api/vault:
+  /analytics/factor-exposure:
     get:
-      tags: [vault]
-      operationId: getVaultPosition
-      summary: Get the user's vault position
+      operationId: getFactorExposure
+      summary: Rolling beta and market-factor exposure report
+      description: |
+        Measures how much of the authenticated user's yield movement is
+        explained by the DeFi-yield "market factor" versus idiosyncratic
+        protocol selection, on a rolling window so exposure can be seen
+        changing over time (#352).
+
+        The market is the canonical equal/TVL-weighted average of tracked
+        `ProtocolRate` APY series (`src/analytics/benchmark.ts`). Each window
+        regresses portfolio daily return on market daily return (OLS): a beta
+        of ~1 means "your yield moves with the tracked-protocol market", ~0
+        means "independent of it".
+
+        This is YIELD co-movement, NOT price beta, and the market is not a
+        traded index — the fixed `caveats[0]` states this on every response.
+        Under-sampled (< 14 aligned days) or zero-market-variance windows
+        report `null` beta/R², never 0 or NaN. Series are intersected on a
+        shared daily grid (never zero-filled); mismatched days are dropped and
+        `sampleCount` reflects the intersection.
+
+        Retention is bounded at 90 days and `rollingWindow` must be shorter
+        than `window`; a rolling window that leaves fewer than 2 windows
+        returns the summary only, with a caveat. `inputHash` (sha256 of the
+        sorted input snapshot) lets the report be reproduced deterministically.
+      tags: [Analytics]
       security:
-        - BearerAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [30d, 60d, 90d]
+            default: 90d
+        - name: rollingWindow
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [7d, 14d, 30d]
+            default: 30d
+        - name: weighting
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [equal, tvl]
+            default: equal
       responses:
         '200':
-          description: Vault position
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/VaultPosition'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-
-  /api/vault/deposit:
-    post:
-      tags: [vault]
-      operationId: depositToVault
-      summary: Move funds into the vault
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [amount]
-              properties:
-                amount:
-                  type: string
-                  example: '200.0000000'
-      responses:
-        '201':
-          description: Vault deposit recorded
+          description: Rolling beta and market-factor exposure report.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  success:
+                  userId:
+                    type: string
+                    format: uuid
+                  window:
+                    type: string
+                  rollingWindow:
+                    type: string
+                  weighting:
+                    type: string
+                    enum: [equal, tvl]
+                  actualWindowDays:
+                    type: integer
+                  insufficientHistory:
                     type: boolean
-                  transaction:
-                    $ref: '#/components/schemas/Transaction'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-
-  /api/vault/withdraw:
-    post:
-      tags: [vault]
-      operationId: withdrawFromVault
-      summary: Move funds out of the vault
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [amount]
-              properties:
-                amount:
-                  type: string
-      responses:
-        '201':
-          description: Vault withdrawal recorded
+                  sampleCount:
+                    type: integer
+                  rolling:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        windowEndMs:
+                          type: integer
+                        sampleCount:
+                          type: integer
+                        beta:
+                          type: number
+                          nullable: true
+                        alpha:
+                          type: number
+                          nullable: true
+                        alphaAnnualized:
+                          type: number
+                          nullable: true
+                        rSquared:
+                          type: number
+                          nullable: true
+                        idiosyncraticVolShare:
+                          type: number
+                          nullable: true
+                  summary:
+                    type: object
+                    nullable: true
+                    properties:
+                      sampleCount:
+                        type: integer
+                      beta:
+                        type: number
+                        nullable: true
+                      alpha:
+                        type: number
+                        nullable: true
+                      alphaAnnualized:
+                        type: number
+                        nullable: true
+                      rSquared:
+                        type: number
+                        nullable: true
+                      idiosyncraticVolShare:
+                        type: number
+                        nullable: true
+                  benchmark:
+                    type: object
+                    properties:
+                      weighting:
+                        type: string
+                        enum: [equal, tvl]
+                      universeSize:
+                        type: integer
+                      tvlFallback:
+                        type: boolean
+                  caveats:
+                    type: array
+                    items:
+                      type: string
+                  inputHash:
+                    type: string
+                  computedAt:
+                    type: string
+                    format: date-time
+        '400':
+          description: Invalid query parameters (e.g. rollingWindow >= window).
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                  transaction:
-                    $ref: '#/components/schemas/Transaction'
+                $ref: '#/components/schemas/ValidationError'
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  # ── Admin ──────────────────────────────────────────────────────────────────
-  /api/admin/users:
+  /analytics/yield-breakdown:
     get:
-      tags: [admin]
-      operationId: adminListUsers
-      summary: List all users (admin only)
+      operationId: getYieldBreakdown
+      summary: Yield base/incentive composition and effective APY
+      description: |
+        Returns the base (market) vs incentive (token-reward) split, incentive
+        share, and haircuted effective APY for the authenticated user's held
+        protocols (all protocols when they hold none) (#349).
+
+        Effective APY = base + incentive × (1 − INCENTIVE_HAIRCUT); protocols
+        with no decomposition fall back to the raw quoted supply APY. The
+        `caveat` travels with every response, and `effectiveApyEnabled` reports
+        whether `USE_EFFECTIVE_APY=true` is gating optimizer/agent consumption.
+      tags: [Analytics]
       security:
-        - AdminToken: []
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Yield composition per held protocol.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userId:
+                    type: string
+                    format: uuid
+                  effectiveApyEnabled:
+                    type: boolean
+                  caveat:
+                    type: string
+                  protocols:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        protocol:
+                          type: string
+                        asset:
+                          type: string
+                        network:
+                          type: string
+                        supplyApy:
+                          type: number
+                        baseApy:
+                          type: number
+                          nullable: true
+                        incentiveApy:
+                          type: number
+                          nullable: true
+                        incentiveShare:
+                          type: number
+                          nullable: true
+                        effectiveApy:
+                          type: number
+                        rewardTokens:
+                          type: array
+                          nullable: true
+                          items:
+                            type: object
+                            properties:
+                              symbol:
+                                type: string
+                              address:
+                                type: string
+                              apy:
+                                type: number
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /analytics/apy-history:
+    get:
+      operationId: getApyHistory
+      summary: APY snapshot history
+      description: |
+        Returns APY snapshots over time for the authenticated user's positions.
+        Graph-ready (sorted ascending by date).
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
       parameters:
+        - name: period
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Period'
+      responses:
+        '200':
+          description: APY history points.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userId:
+                    type: string
+                    format: uuid
+                  period:
+                    $ref: '#/components/schemas/Period'
+                  points:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date:
+                          type: string
+                          format: date
+                        apy:
+                          type: number
+                        positionId:
+                          type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /analytics/user-yield:
+    get:
+      operationId: getUserYield
+      summary: User yield summary
+      description: Returns cumulative and period yield earned by the authenticated user.
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: period
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Period'
+      responses:
+        '200':
+          description: Yield summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userId:
+                    type: string
+                    format: uuid
+                  period:
+                    $ref: '#/components/schemas/Period'
+                  totalYield:
+                    type: number
+                  periodYield:
+                    type: number
+                  averageApy:
+                    type: number
+                  points:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /analytics/user-yield/export:
+    get:
+      operationId: exportUserYield
+      summary: User yield summary (CSV export)
+      description: |
+        Same data as GET /analytics/user-yield, as a downloadable CSV — one
+        row per yield snapshot point, with the period totals repeated on
+        every row (#405).
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: period
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Period'
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [csv]
+            default: csv
+      responses:
+        '200':
+          description: CSV file.
+          content:
+            text/csv:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /analytics/protocol-performance:
+    get:
+      operationId: getProtocolPerformance
+      summary: Protocol APY history
+      description: Returns historical APY rates per protocol. Public endpoint (no auth required).
+      tags: [Analytics]
+      security: []
+      parameters:
+        - name: period
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Period'
+      responses:
+        '200':
+          description: Protocol APY history grouped by protocol.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  period:
+                    $ref: '#/components/schemas/Period'
+                  protocols:
+                    type: array
+                    items:
+                      type: object
+
+  # ── Agent decisions (#343) ────────────────────────────────────────────────────
+
+  /agent/decisions:
+    get:
+      operationId: listAgentDecisions
+      summary: List own rebalance decisions
+      description: |
+        Owner-scoped decision listing for the per-decision rationale ledger (#343).
+        Visible iff the caller is in `affectedUserIds`; the response is projected
+        to that user's view (no sibling `affectedUserIds`, no other user's position
+        sizes). The decision is the batch evaluation that the agent loop ran for
+        `protocol:strategy:followId` — REBALANCED, HELD, or BLOCKED — with the
+        snapshotted thresholds, the APY inputs, the ranked candidates and their
+        per-candidate rejection reasons, and — when the decision linked an
+        `outboxOpId` — its current outbox `status` so the UI can explain
+        “decided to rebalance → on-chain submission failed”.
+
+        **Real-time counterpart**: every new decision row emits `agent.decision_recorded`
+        on the same users' streams (seq-ordered, replayable).
+      tags: [Agent]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: outcome
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [REBALANCED, HELD, BLOCKED]
+        - name: fromProtocol
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Inclusive lower bound on `createdAt`.
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Inclusive upper bound on `createdAt`.
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+        - name: sortBy
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [createdAt, outcome, fromProtocol]
+            default: createdAt
+        - name: sortOrder
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        '200':
+          description: Paginated decision listing (user-projected).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginationMeta'
+                  - type: object
+                    properties:
+                      decisions:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RebalanceDecision'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /agent/decisions/{id}:
+    get:
+      operationId: getAgentDecision
+      summary: Get one rebalance decision (full trace)
+      description: |
+        Full trace for a single decision, including the ranked `candidates`.
+        Visible iff the caller is in `affectedUserIds`; otherwise 404.
+      tags: [Agent]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Full decision trace (user-projected).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RebalanceDecision'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Decision not found or not visible to caller.
+
+  /admin/agent/decisions:
+    get:
+      operationId: listAdminAgentDecisions
+      summary: Admin — list all rebalance decisions
+      description: |
+        Unrestricted, admin-scoped decision listing for support/audit.
+        Requires `read` admin scope; every call is written to `AdminAuditLog`
+        as `LIST_AGENT_DECISIONS`.
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: outcome
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [REBALANCED, HELD, BLOCKED]
+        - name: fromProtocol
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: correlationId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: batchKey
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+      responses:
+        '200':
+          description: Paginated decision listing (admin — includes affectedUserIds).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+                  total:
+                    type: integer
+                  decisions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RebalanceDecisionAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing or insufficient admin scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedError'
+
+  # ── Network conditions (#342) ─────────────────────────────────────────────────
+
+  /network/conditions:
+    get:
+      operationId: getNetworkConditions
+      summary: Current network fee and congestion snapshot
+      description: |
+        Adaptive base-fee oracle snapshot (#342) — recommended base fee (p70),
+        aggressive base fee (p95), congestion level with hysteresis, ledger
+        capacity usage, plus per-priority ETA bands derived from recent
+        outbox latency percentiles. Public, rate-limited.
+      tags: [Network]
+      security: []
+      responses:
+        '200':
+          description: Fee snapshot + ETA bands.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      recommendedBaseFee:
+                        type: integer
+                      aggressiveBaseFee:
+                        type: integer
+                      congestionLevel:
+                        type: string
+                        enum: [low, elevated, high, severe]
+                      ledgerCapacityUsage:
+                        type: number
+                      sampledAt:
+                        type: string
+                        format: date-time
+                      ttlMs:
+                        type: integer
+                      stale:
+                        type: boolean
+                      etaBands:
+                        type: object
+                        properties:
+                          LOW:
+                            type: object
+                            properties:
+                              minSeconds:
+                                type: integer
+                              maxSeconds:
+                                type: integer
+                          NORMAL:
+                            type: object
+                            properties:
+                              minSeconds:
+                                type: integer
+                              maxSeconds:
+                                type: integer
+                          CRITICAL:
+                            type: object
+                            properties:
+                              minSeconds:
+                                type: integer
+                              maxSeconds:
+                                type: integer
+
+  # ── Stress testing (#351) ─────────────────────────────────────────────────────
+
+  /analytics/stress/scenarios:
+    get:
+      operationId: getStressScenarios
+      summary: List built-in stress scenarios
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Scenario library.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scenarios:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StressScenario'
+                  caveat:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /analytics/stress:
+    post:
+      operationId: runStressTest
+      summary: Run scenario stress test on current portfolio
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scenarioId:
+                  type: string
+                  example: stablecoin_depeg_2022
+                custom:
+                  type: object
+                  properties:
+                    assetPriceShockPct:
+                      type: object
+                      additionalProperties:
+                        type: number
+                    apyShockPct:
+                      oneOf:
+                        - type: number
+                        - type: object
+                          additionalProperties:
+                            type: number
+                    incentiveApyToZero:
+                      type: boolean
+                    protocolLossPct:
+                      type: object
+                      additionalProperties:
+                        type: number
+                    recoveryDays:
+                      type: integer
+                runAll:
+                  type: boolean
+                asOf:
+                  type: string
+                  format: date-time
+      responses:
+        '200':
+          description: Stress result (or ranked runAll).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StressResult'
+        '400':
+          $ref: '#/components/responses/Unauthorized'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ── Real-time WebSocket stream (#316) ─────────────────────────────────────────
+
+  /ws:
+    get:
+      operationId: openRealtimeStream
+      summary: Open the authenticated real-time event stream
+      description: |
+        Upgrades to a WebSocket carrying this user's live, sequence-numbered
+        event stream. Not a REST endpoint: the only HTTP response a client
+        should ever see is a rejection — success is a `101 Switching Protocols`
+        followed by the JSON subprotocol below.
+
+        Full client contract, including reconnect policy and worked examples:
+        `docs/WEBSOCKET_STREAMING.md`.
+
+        ### Authentication
+        The same JWT + live-session check the REST middleware performs, run
+        BEFORE the protocol switch — an unauthenticated peer gets a 401 and
+        never becomes a WebSocket. There is no anonymous channel.
+
+        Send the token either as `Authorization: Bearer <jwt>` (server-side
+        clients) or as the subprotocol pair `Sec-WebSocket-Protocol: bearer,
+        <jwt>` (browsers, which cannot set headers on a WebSocket). A `?token=`
+        query parameter is deliberately NOT accepted: URLs reach access logs,
+        proxy logs, and referrers, and this token is a live session.
+
+        A session revoked while the socket is open closes it with code 4408 —
+        the server rechecks the session periodically rather than trusting the
+        handshake forever.
+
+        ### Message flow
+        1. Server sends `hello` with the topics you may read and `currentSeq`.
+        2. Client sends `subscribe` (live from now) or `resume` (replay first).
+        3. Server sends `event` frames; each carries a monotonic per-user `seq`.
+        4. On reconnect, client sends `resume` with the highest `seq` it
+           durably processed. Missed events replay, then live resumes.
+
+        ### Delivery guarantees
+        At-least-once, with a duplication window around a reconnect — dedupe on
+        `seq`. Within a topic, events are ordered; across topics they are not.
+
+        ### Heartbeat and idle policy
+        The server pings every `heartbeatIntervalMs` (default 30s). A connection
+        that neither pongs nor sends a frame for `WS_IDLE_TIMEOUT_MS` (default
+        90s) is closed with code 4408. Clients that cannot observe protocol
+        pongs may send `{"type":"ping"}` instead.
+
+        ### Backpressure
+        A slow consumer is never buffered without bound. Past the per-connection
+        bound the server stops delivering, sends one `gap` frame with reason
+        `backpressure`, and waits for a `resume`. Nothing is lost — the durable
+        stream still holds every event.
+
+        ### Limits
+        Handshakes are rate-limited per source IP (`429` on the upgrade), client
+        messages per connection (`rate_limited` error frame, then close 4429),
+        and each user may hold `WS_MAX_CONNECTIONS_PER_USER` sockets per pod.
+
+        ### Close codes
+        | Code | Meaning |
+        |------|---------|
+        | 1000 | Normal closure |
+        | 1001 | Server draining (preceded by a `draining` frame) |
+        | 4401 | Unauthenticated |
+        | 4403 | Actor not permitted |
+        | 4408 | Session revoked, or idle timeout |
+        | 4429 | Message rate limit exceeded |
+      tags: [Realtime]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: actor
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: |
+            Bind the connection to a sub-account's stream instead of your own.
+            The ACTIVE `SubAccount` grant is verified server-side and its
+            permissions decide the readable topics (`VIEW` → portfolio,
+            transactions, agent, alerts; `MANAGE_STRATEGY` → strategies).
+            Same enforcement as the REST `actingAsUserId` routes; the client's
+            opinion about its own scope is never consulted.
+        - name: Sec-WebSocket-Protocol
+          in: header
+          required: false
+          schema:
+            type: string
+            example: bearer, eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+          description: Browser alternative to the Authorization header.
+      requestBody:
+        required: false
+        description: |
+          Not an HTTP body — documents the frames the client sends over the
+          socket after the upgrade.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebSocketClientMessage'
+      responses:
+        '101':
+          description: |
+            Protocol switched. Every subsequent server frame is one of
+            `WebSocketServerFrame`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebSocketServerFrame'
+        '401':
+          description: Missing, malformed, expired, or revoked credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedError'
+        '403':
+          description: No ACTIVE sub-account grant for the requested `actor`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedError'
+        '429':
+          description: Handshake rate limit, or too many concurrent connections.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedError'
+
+  # ── Alert rules (#366) ────────────────────────────────────────────────────────
+
+  /alerts:
+    post:
+      operationId: createAlertRule
+      summary: Create a new alert rule
+      description: |
+        Create an alert rule to monitor a portfolio metric or protocol APY.
+        Requires `alerts:manage` scope.
+      tags: [Alerts]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [metric, comparator, threshold, deliveryChannel]
+              properties:
+                metric:
+                  type: string
+                  enum: [PROTOCOL_APY, PORTFOLIO_VALUE]
+                protocolName:
+                  type: string
+                  nullable: true
+                  description: Required when metric is PROTOCOL_APY.
+                comparator:
+                  type: string
+                  enum: [LT, GT, EQ]
+                threshold:
+                  type: string
+                  description: Threshold as decimal string.
+                deliveryChannel:
+                  type: string
+                  enum: [WEBHOOK, TELEGRAM, WHATSAPP, EMAIL]
+                cooldownMinutes:
+                  type: integer
+                  description: Minutes between alert fires (default 60).
+      responses:
+        '201':
+          description: Alert rule created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+        '400':
+          description: Validation failed.
+        '401':
+          description: Missing/invalid bearer token or insufficient scope.
+
+  /alerts/{id}:
+    get:
+      operationId: listAlertRules
+      summary: List alert rules for a user
+      description: Owner-scoped — caller may only list their own rules.
+      tags: [Alerts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+          description: User ID (must match authenticated user).
+      responses:
+        '200':
+          description: List of alert rules.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rules:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AlertRule'
+        '401':
+          description: Missing/invalid bearer token or access denied.
+        '403':
+          description: Not the owner of the requested user ID.
+
+    patch:
+      operationId: updateAlertRule
+      summary: Update an alert rule
+      description: Requires `alerts:manage` scope.
+      tags: [Alerts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Alert rule ID.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                metric:
+                  type: string
+                  enum: [PROTOCOL_APY, PORTFOLIO_VALUE]
+                protocolName:
+                  type: string
+                  nullable: true
+                comparator:
+                  type: string
+                  enum: [LT, GT, EQ]
+                threshold:
+                  type: string
+                deliveryChannel:
+                  type: string
+                  enum: [WEBHOOK, TELEGRAM, WHATSAPP, EMAIL]
+                cooldownMinutes:
+                  type: integer
+                isActive:
+                  type: boolean
+      responses:
+        '200':
+          description: Alert rule updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+        '400':
+          description: Validation failed.
+        '401':
+          description: Missing/invalid bearer token or insufficient scope.
+        '404':
+          description: Alert rule not found.
+
+    delete:
+      operationId: deleteAlertRule
+      summary: Delete an alert rule
+      description: Requires `alerts:manage` scope.
+      tags: [Alerts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Alert rule ID.
+      responses:
+        '204':
+          description: Alert rule deleted.
+        '401':
+          description: Missing/invalid bearer token or insufficient scope.
+        '404':
+          description: Alert rule not found.
+
+  # ── User webhook endpoints (#368) ──────────────────────────────────────────
+
+  /webhooks/endpoints:
+    post:
+      operationId: createWebhookEndpoint
+      summary: Create a user webhook endpoint
+      description: |
+        Create a new outbound webhook endpoint for real-time event delivery.
+        URL must be HTTPS and not point to localhost or private addresses.
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  description: HTTPS callback URL.
+                events:
+                  type: array
+                  items:
+                    type: string
+                  description: Event types to subscribe to.
+                topicScope:
+                  type: string
+                  nullable: true
+                filterJson:
+                  type: object
+                  nullable: true
+      responses:
+        '201':
+          description: Webhook endpoint created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/UserWebhookEndpoint'
+                  - type: object
+                    properties:
+                      secret:
+                        type: string
+                        description: Signing secret (returned once; store securely).
+        '400':
+          description: Validation failed or invalid URL.
+        '401':
+          description: Missing/invalid bearer token.
+
+    get:
+      operationId: listWebhookEndpoints
+      summary: List user webhook endpoints
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List of webhook endpoints.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoints:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UserWebhookEndpoint'
+        '401':
+          description: Missing/invalid bearer token.
+
+  /webhooks/endpoints/{id}:
+    get:
+      operationId: getWebhookEndpoint
+      summary: Get a webhook endpoint
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Webhook endpoint ID.
+      responses:
+        '200':
+          description: Webhook endpoint details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWebhookEndpoint'
+        '401':
+          description: Missing/invalid bearer token.
+        '404':
+          description: Webhook endpoint not found.
+
+    patch:
+      operationId: updateWebhookEndpoint
+      summary: Update a webhook endpoint
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Webhook endpoint ID.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+                events:
+                  type: array
+                  items:
+                    type: string
+                topicScope:
+                  type: string
+                  nullable: true
+                filterJson:
+                  type: object
+                  nullable: true
+                isActive:
+                  type: boolean
+      responses:
+        '200':
+          description: Webhook endpoint updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWebhookEndpoint'
+        '400':
+          description: Validation failed.
+        '401':
+          description: Missing/invalid bearer token.
+        '404':
+          description: Webhook endpoint not found.
+
+    delete:
+      operationId: deleteWebhookEndpoint
+      summary: Delete a webhook endpoint
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Webhook endpoint ID.
+      responses:
+        '204':
+          description: Webhook endpoint deleted.
+        '401':
+          description: Missing/invalid bearer token.
+        '404':
+          description: Webhook endpoint not found.
+
+  /webhooks/endpoints/{id}/rotate-secret:
+    post:
+      operationId: rotateWebhookSecret
+      summary: Rotate webhook endpoint secret
+      description: |
+        Begin secret rotation with dual-signing period. Returns new secret and
+        activation time. Old secret remains valid until activation time.
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Webhook endpoint ID.
+      responses:
+        '200':
+          description: Secret rotation initiated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secretNext:
+                    type: string
+                    description: New secret (store securely).
+                  secretNextActiveAt:
+                    type: string
+                    format: date-time
+                    description: When new secret becomes active.
+                  message:
+                    type: string
+        '401':
+          description: Missing/invalid bearer token.
+        '404':
+          description: Webhook endpoint not found.
+
+  /webhooks/endpoints/{id}/test:
+    post:
+      operationId: testWebhookEndpoint
+      summary: Send a test ping to webhook endpoint
+      description: Sends a test event to verify endpoint is reachable and signature validation works.
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Webhook endpoint ID.
+      responses:
+        '200':
+          description: Test event sent.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+        '401':
+          description: Missing/invalid bearer token.
+        '404':
+          description: Webhook endpoint not found.
+
+  /webhooks/endpoints/{id}/deliveries:
+    get:
+      operationId: listWebhookDeliveries
+      summary: List webhook event deliveries
+      description: Lists recent delivery attempts for this endpoint with status and timestamps.
+      tags: [Webhooks]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Webhook endpoint ID.
         - in: query
           name: limit
           schema:
             type: integer
             default: 50
-        - in: query
-          name: cursor
-          schema:
-            type: string
+          description: Maximum deliveries to return.
       responses:
         '200':
-          description: User list
+          description: List of delivery attempts.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  data:
+                  deliveries:
                     type: array
                     items:
                       type: object
                       properties:
-                        address:
+                        id:
+                          type: string
+                          format: uuid
+                        status:
+                          type: string
+                          enum: [PENDING, SUCCESS, FAILED]
+                        event:
                           type: string
                         createdAt:
                           type: string
                           format: date-time
-                  nextCursor:
-                    type: string
-                    nullable: true
+                        completedAt:
+                          type: string
+                          format: date-time
+                          nullable: true
         '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
+          description: Missing/invalid bearer token.
+        '404':
+          description: Webhook endpoint not found.
 
-  /api/admin/stats:
+  # ── Private net worth and external wallets (#540) ─────────────────────────────
+
+  /net-worth:
     get:
-      tags: [admin]
-      operationId: adminGetStats
-      summary: Platform statistics (admin only)
+      operationId: getPrivateNetWorth
+      summary: Get owner-private net worth
+      description: |
+        Combines active platform positions and read-only linked external wallet
+        balances for the authenticated user only. Every holding is tagged with
+        its source. External links are always unverified self-reported data;
+        unpriced balances are null and stale snapshots carry an as-of timestamp.
+        This data is not used in tax reports, agent decisions, or marketplace
+        track records.
+      tags: [Net Worth]
       security:
-        - AdminToken: []
+        - bearerAuth: []
       responses:
         '200':
-          description: Platform stats
+          description: Private source-tagged holdings and valuation completeness.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NetWorthResponse'
+        '401':
+          description: Missing/invalid bearer token.
+
+  /net-worth/external-wallets:
+    get:
+      operationId: listExternalWallets
+      summary: List the caller's external Stellar wallet links
+      tags: [Net Worth]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Owner-scoped external wallet links and sync freshness.
           content:
             application/json:
               schema:
                 type: object
+                required: [wallets]
                 properties:
-                  totalUsers:
-                    type: integer
-                  totalVolumeUsdc:
-                    type: string
-                  activeVaults:
-                    type: integer
+                  wallets:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ExternalWalletLinkResponse'
         '401':
-          $ref: '#/components/responses/Unauthorized'
+          description: Missing/invalid bearer token.
+
+    post:
+      operationId: linkExternalWallet
+      summary: Link an external Stellar address as unverified and read-only
+      description: |
+        This does not prove address ownership and does not grant signing,
+        transaction, or custody capability. The address is labeled
+        UNVERIFIED_SELF_REPORTED and appears only in the caller's private views.
+        The caller's platform-managed addresses cannot be linked as external.
+        API keys must have the `portfolio:write` scope.
+      tags: [Net Worth]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExternalWalletLinkRequest'
+      responses:
+        '201':
+          description: External address linked; response explicitly marks it unverified.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExternalWalletLinkResponse'
+        '400':
+          description: Invalid Stellar public key or label.
+        '401':
+          description: Missing/invalid bearer token.
+        '409':
+          description: Address is already linked, platform-managed, or the per-user link limit is reached.
+
+  /net-worth/external-wallets/{id}:
+    delete:
+      operationId: removeExternalWallet
+      summary: Remove one of the caller's external wallet links
+      description: Removal immediately excludes its balances from net-worth and opted-in goal calculations.
+      tags: [Net Worth]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: External wallet link removed.
+        '401':
+          description: Missing/invalid bearer token.
+        '404':
+          description: External wallet not found for the caller.
+
+  /portfolio/goals:
+    post:
+      operationId: createSavingsGoal
+      summary: Create a savings goal
+      description: External balances remain excluded unless `includeExternalHoldings` is explicitly true.
+      tags: [Portfolio]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GoalCreateRequest'
+      responses:
+        '201':
+          description: Savings goal created.
+        '400':
+          description: Goal validation failed.
+        '401':
+          description: Missing/invalid bearer token.
+        '409':
+          description: Caller already has an active goal.
+
+  /portfolio/goals/{id}:
+    patch:
+      operationId: updateSavingsGoal
+      summary: Update a savings goal
+      description: Set `includeExternalHoldings` to opt in or out; the default for existing goals is false.
+      tags: [Portfolio]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GoalUpdateRequest'
+      responses:
+        '200':
+          description: Savings goal updated.
+        '400':
+          description: Goal validation failed.
+        '401':
+          description: Missing/invalid bearer token or the caller does not own the goal.
+        '404':
+          description: Goal not found.
+
+  /portfolio/goals/{id}/progress:
+    get:
+      operationId: getSavingsGoalProgress
+      summary: Get owner-scoped savings goal progress
+      description: |
+        When `includeExternalHoldings` is true, current known external value is
+        included as a static contribution. The projection applies managed APY
+        only to managed principal, and reports stale wallet and unpriced holding
+        counts. The owner remains the only audience for unverified values.
+      tags: [Portfolio]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Owner-only goal trajectory and external snapshot caveats.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GoalProgressResponse'
+        '401':
+          description: Missing/invalid bearer token or goal belongs to another user.
+        '404':
+          description: Goal not found.
+
+  # ── Health ────────────────────────────────────────────────────────────────────
+
+  /health/live:
+    get:
+      operationId: getLiveness
+      summary: Liveness probe
+      description: Always returns 200 once the process is running.
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Process alive.
+
+  /health/ready:
+    get:
+      operationId: getReadiness
+      summary: Readiness probe
+      description: Returns 200 only when all background services are healthy.
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: All services ready.
+        '503':
+          description: One or more services not ready.
+  /admin/erasure/requests:
+    get:
+      tags:
+        - Admin
+      operationId: adminListErasureRequests
+      summary: List privacy erasure requests
+      security:
+        - adminAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [PENDING, APPROVED, REJECTED, COMPLETED, FAILED]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Successful operation
+        '401':
+          description: Authentication required or verification failed
         '403':
-          $ref: '#/components/responses/Forbidden'
-
-  # ── Reusable responses ────────────────────────────────────────────────────
-  responses: {}
-
-components:
-  responses:
-    Unauthorized:
-      description: Missing or invalid authentication token
-      content:
-        application/json:
+          description: Forbidden
+        '429':
+          description: Erasure rate limit exceeded
+    post:
+      tags:
+        - Admin
+      operationId: adminCreateErasureRequest
+      summary: Create a privacy erasure request (does not delete anything)
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, reason]
+              properties:
+                userId:
+                  type: string
+                reason:
+                  type: string
+      responses:
+        '201':
+          description: Request created in PENDING status
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '429':
+          description: Erasure rate limit exceeded
+  /admin/erasure/requests/{id}/approve:
+    post:
+      tags:
+        - Admin
+      operationId: adminApproveErasureRequest
+      summary: Approve an erasure request; the approver must differ from the requester
+      security:
+        - adminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error: Unauthorized
-    Forbidden:
-      description: Authenticated but insufficient permissions
-      content:
-        application/json:
+            type: string
+      responses:
+        '200':
+          description: Request approved
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden, or self-approval attempted
+        '429':
+          description: Erasure rate limit exceeded
+  /admin/erasure/requests/{id}/reject:
+    post:
+      tags:
+        - Admin
+      operationId: adminRejectErasureRequest
+      summary: Reject a pending erasure request
+      security:
+        - adminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error: Forbidden
-    BadRequest:
-      description: Invalid request body or parameters
-      content:
-        application/json:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rejectionReason]
+              properties:
+                rejectionReason:
+                  type: string
+      responses:
+        '200':
+          description: Request rejected
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '429':
+          description: Erasure rate limit exceeded
+  /admin/erasure/requests/{id}/execute:
+    post:
+      tags:
+        - Admin
+      operationId: adminExecuteErasureRequest
+      summary: Dry-run or execute an approved erasure (IRREVERSIBLE)
+      description: |
+        Without `confirm` this is a dry run that returns a preview and the
+        required phrase. With `confirm` equal to `DELETE <userId>` the erasure
+        runs: the user's sessions are revoked first, then data is deleted. The
+        executing admin must differ from the approving admin.
+      security:
+        - adminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                confirm:
+                  type: string
+                  example: DELETE 3f1c9a52-0000-0000-0000-000000000000
+      responses:
+        '200':
+          description: Dry-run preview (`dryRun` true) or erasure summary (`dryRun` false)
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden, or the approver attempted to execute
+        '422':
+          description: Typed confirmation missing or wrong
+        '429':
+          description: Erasure rate limit exceeded
+  /admin/erasure/preview/{userId}:
+    get:
+      tags:
+        - Admin
+      operationId: adminPreviewErasure
+      summary: Preview the records an erasure would delete or anonymize
+      security:
+        - adminAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful operation
+        '401':
+          description: Authentication required or verification failed
+        '403':
+          description: Forbidden
+        '429':
+          description: Erasure rate limit exceeded

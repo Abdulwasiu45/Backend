@@ -1,10 +1,12 @@
-import { NextFunction, Request, Response } from 'express';
-import { JwtAdapter } from '../config';
-import db from '../db';
-import { logger } from '../utils/logger';
+import { NextFunction, Request, Response } from 'express'
+import { JwtAdapter } from '../config'
+import db from '../db'
+import { resolveApproxLocation } from '../utils/geoip'
+import { logger } from '../utils/logger'
+import { authenticateApiKey, isUserApiKeyToken } from './apiKeyAuth'
+import { evaluateAndHandleSessionAnomaly } from '../services/session-anomaly.service'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -14,21 +16,22 @@ const AUTH_ERRORS = {
   INVALID_TOKEN: 'Invalid token',
   SESSION_NOT_FOUND: 'Session not found',
   SESSION_EXPIRED: 'Session expired',
+  SESSION_REVOKED: 'session_revoked',
   USER_INACTIVE: 'User account is inactive',
   INTERNAL_ERROR: 'Internal server error',
-} as const;
+} as const
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function extractBearerToken(authHeader: string | undefined): string | null {
-  if (!authHeader) return null;
-  if (!authHeader.startsWith('Bearer ')) return null;
-  const token = authHeader.slice(7).trim(); // 'Bearer '.length === 7
-  return token.length > 0 ? token : null;
+  if (!authHeader) return null
+  if (!authHeader.startsWith('Bearer ')) return null
+  const token = authHeader.slice(7).trim() // 'Bearer '.length === 7
+  return token.length > 0 ? token : null
 }
 
 function isExpired(date: Date): boolean {
-  return date < new Date();
+  return date < new Date()
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
@@ -49,76 +52,116 @@ function isExpired(date: Date): boolean {
 export async function requireAuth(
   req: Request,
   res: Response,
-  next: NextFunction,
+  next: NextFunction
 ): Promise<void> {
-  const authHeader = req.header('Authorization');
+  const authHeader = req.header('Authorization')
 
   // 1. Header presence
   if (!authHeader) {
-    res.status(401).json({ error: AUTH_ERRORS.UNAUTHORIZED });
-    return;
+    res.status(401).json({ error: AUTH_ERRORS.UNAUTHORIZED })
+    return
   }
 
   // 2. Bearer format
   if (!authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: AUTH_ERRORS.INVALID_BEARER });
-    return;
+    res.status(401).json({ error: AUTH_ERRORS.INVALID_BEARER })
+    return
   }
 
-  const token = extractBearerToken(authHeader);
+  const token = extractBearerToken(authHeader)
   if (!token) {
-    res.status(401).json({ error: AUTH_ERRORS.INVALID_TOKEN });
-    return;
+    res.status(401).json({ error: AUTH_ERRORS.INVALID_TOKEN })
+    return
+  }
+
+  // #374 — route scoped per-user API keys via dedicated auth path
+  if (isUserApiKeyToken(token)) {
+    return authenticateApiKey(req, res, next)
   }
 
   try {
     // 3. JWT signature verification
-    const payload = await JwtAdapter.validateToken<{ id: string }>(token);
+    const payload = await JwtAdapter.validateToken<{ id: string }>(token)
     if (!payload) {
-      res.status(401).json({ error: AUTH_ERRORS.INVALID_TOKEN });
-      return;
+      res.status(401).json({ error: AUTH_ERRORS.INVALID_TOKEN })
+      return
     }
 
     // 4. Live session lookup
     const session = await db.session.findUnique({
       where: { token },
       include: { user: { select: { id: true, isActive: true } } },
-    });
+    })
 
     if (!session) {
-      res.status(401).json({ error: AUTH_ERRORS.SESSION_NOT_FOUND });
-      return;
+      res.status(401).json({ error: AUTH_ERRORS.SESSION_NOT_FOUND })
+      return
+    }
+
+    // #376 — revoked sessions fail immediately
+    if (session.revokedAt) {
+      res.status(401).json({ error: AUTH_ERRORS.SESSION_REVOKED })
+      return
+    }
+
+    // #515 — Session anomaly evaluation & forced revocation check
+    const isAnomalous = await evaluateAndHandleSessionAnomaly(session, {
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+    })
+
+    if (isAnomalous) {
+      res.status(401).json({
+        error: AUTH_ERRORS.SESSION_REVOKED,
+        reason: 'session_anomaly_detected',
+      })
+      return
     }
 
     // 5. Expiry check — delete stale row in the background, don't await
     if (isExpired(session.expiresAt)) {
-      db.session.delete({ where: { token } }).catch((err) =>
-        logger.error('[Auth] Failed to delete expired session:', err),
-      );
-      res.status(401).json({ error: AUTH_ERRORS.SESSION_EXPIRED });
-      return;
+      db.session
+        .delete({ where: { token } })
+        .catch((err) =>
+          logger.error('[Auth] Failed to delete expired session:', err)
+        )
+      res.status(401).json({ error: AUTH_ERRORS.SESSION_EXPIRED })
+      return
     }
 
     // 6. Active user check
     if (!session.user.isActive) {
-      res.status(401).json({ error: AUTH_ERRORS.USER_INACTIVE });
-      return;
+      res.status(401).json({ error: AUTH_ERRORS.USER_INACTIVE })
+      return
     }
 
     // 7. Attach identity to request
-    req.userId       = session.user.id;
-    req.stellarPubKey = session.walletAddress;
+    req.userId = session.user.id
+    req.stellarPubKey = session.walletAddress
+    req.authKind = 'session'
+    req.authScopes = ['*']
     req.auth = {
-      userId:        session.userId,
-      sessionId:     session.id,
+      userId: session.userId,
+      sessionId: session.id,
       walletAddress: session.walletAddress,
-      network:       session.network,
-    };
+      network: session.network,
+    }
 
-    next();
+    // Keep time, IP and location from the same accepted request together.
+    // Await persistence so the next request cannot compare against stale location.
+    await db.session.update({
+      where: { id: session.id },
+      data: {
+        lastSeenAt: new Date(),
+        lastSeenIp: req.ip ?? null,
+        approxLocation: resolveApproxLocation(req.ip),
+      },
+    })
+
+    next()
   } catch (error) {
-    logger.error('[Auth] Middleware error:', error);
-    res.status(500).json({ error: AUTH_ERRORS.INTERNAL_ERROR });
+    logger.error('[Auth] Middleware error:', error)
+    res.status(500).json({ error: AUTH_ERRORS.INTERNAL_ERROR })
   }
 }
 
@@ -132,21 +175,21 @@ export async function requireAuth(
 export function enforceUserAccess(
   req: Request,
   res: Response,
-  next: NextFunction,
+  next: NextFunction
 ): void {
   if (!req.auth) {
-    res.status(401).json({ error: AUTH_ERRORS.UNAUTHORIZED });
-    return;
+    res.status(401).json({ error: AUTH_ERRORS.UNAUTHORIZED })
+    return
   }
 
-  const targetUserId = req.params.userId ?? req.body?.userId;
+  const targetUserId = req.params.userId ?? req.body?.userId
 
   if (targetUserId && req.auth.userId !== targetUserId) {
-    res.status(401).json({ error: AUTH_ERRORS.UNAUTHORIZED });
-    return;
+    res.status(401).json({ error: AUTH_ERRORS.UNAUTHORIZED })
+    return
   }
 
-  next();
+  next()
 }
 
 /**
@@ -161,5 +204,5 @@ export function enforceUserAccess(
  */
 export class AuthMiddleware {
   /** @deprecated Use `requireAuth` directly */
-  static readonly validateJwt = requireAuth;
+  static readonly validateJwt = requireAuth
 }

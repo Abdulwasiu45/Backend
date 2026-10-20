@@ -1,0 +1,271 @@
+import { z } from 'zod'
+
+/**
+ * Validators for the strategy marketplace (#285).
+ *
+ * This is the input layer of the three-layer anonymization boundary
+ * (query → mapper → input; see docs/STRATEGY_MARKETPLACE.md). The query and
+ * mapper layers stop the SERVER from leaking a publisher's identity; this layer
+ * stops the PUBLISHER from leaking it themselves. `label` is the only free text
+ * a user can put in front of strangers, so it is the only self-doxx vector in
+ * the feature.
+ */
+
+/**
+ * Publishable strategies. GOAL_TRACKING is deliberately excluded: it is driven
+ * by the publisher's own SavingsGoal target and date, which are personal
+ * figures that mean nothing to a follower and would have to be copied to work
+ * at all. Followers with their own goal already get goal precedence anyway.
+ */
+export const PUBLISHABLE_STRATEGIES = [
+  'MAX_YIELD',
+  'TARGET_ALLOCATION',
+] as const
+
+export const MARKETPLACE_WINDOWS = ['30d', '90d'] as const
+export const MARKETPLACE_SORT_FIELDS = ['apy', 'sharpe'] as const
+
+export type MarketplaceWindow = (typeof MARKETPLACE_WINDOWS)[number]
+export type MarketplaceSortField = (typeof MARKETPLACE_SORT_FIELDS)[number]
+
+export const MAX_LABEL_LENGTH = 60
+export const MAX_DESCRIPTION_LENGTH = 280
+export const MAX_TAGS = 5
+
+/** Stellar account (G…) or contract (C…) address: prefix + 55 base32 chars. */
+const STELLAR_ADDRESS_PATTERN = /[GC][A-Z2-7]{55}/
+
+/** A 32+ char hex run — key material, tx hashes, and most secret formats. */
+const LONG_HEX_PATTERN = /[0-9a-fA-F]{32,}/
+
+/**
+ * Free-text label shown to other users. Length-capped and screened for the two
+ * identifiers that would deanonymize the publisher if pasted in. Rejected
+ * rather than stripped: silently mangling someone's label hides that we found
+ * an address in it, and a user who pasted their wallet address needs to know.
+ */
+export const strategyLabelSchema = z
+  .string()
+  .trim()
+  .min(1, 'label is required')
+  .max(MAX_LABEL_LENGTH, `label must be at most ${MAX_LABEL_LENGTH} characters`)
+  .refine((v) => !STELLAR_ADDRESS_PATTERN.test(v), {
+    message:
+      'label must not contain a Stellar address — published strategies are anonymous',
+  })
+  .refine((v) => !LONG_HEX_PATTERN.test(v), {
+    message:
+      'label must not contain long hexadecimal strings — published strategies are anonymous',
+  })
+
+/**
+ * A per-protocol exposure cap override (#346): a maxFraction in (0,1] and/or a
+ * non-negative maxAbsolute. Validated here so a malformed cap set is rejected at
+ * write time with a named issue rather than wedging the agent loop later.
+ */
+const exposureCapOverrideSchema = z
+  .object({
+    maxFraction: z
+      .number()
+      .finite()
+      .gt(0, 'maxFraction must be greater than 0')
+      .lte(1, 'maxFraction must be at most 1')
+      .optional(),
+    maxAbsolute: z
+      .union([
+        z.number().finite().nonnegative(),
+        z
+          .string()
+          .regex(/^\d+(\.\d+)?$/, 'maxAbsolute must be a non-negative number'),
+      ])
+      .optional(),
+  })
+  .refine((v) => v.maxFraction !== undefined || v.maxAbsolute !== undefined, {
+    message: 'each exposure cap must define maxFraction and/or maxAbsolute',
+  })
+
+/**
+ * The exact three keys the agent loop reads. Nothing else is copied to a
+ * follower — notably `riskTolerance`, which stays personal to each user.
+ * `exposureCaps` and `defaultMaxFraction` (#346) are per-user risk controls and
+ * ARE copied under the tighten-only rule, so a valid cap set is required here.
+ */
+export const publishableConfigSchema = z
+  .object({
+    strategyName: z.enum(PUBLISHABLE_STRATEGIES),
+    targetAllocations: z
+      .record(z.string().min(1).max(100), z.number().finite().min(0).max(100))
+      .optional(),
+    riskCeiling: z.number().int().min(0).max(100).optional(),
+    defaultMaxFraction: z
+      .number()
+      .finite()
+      .gt(0, 'defaultMaxFraction must be greater than 0')
+      .lte(1, 'defaultMaxFraction must be at most 1')
+      .optional(),
+    exposureCaps: z
+      .record(z.string().min(1).max(100), exposureCapOverrideSchema)
+      .optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.strategyName === 'TARGET_ALLOCATION') {
+      const entries = Object.entries(data.targetAllocations ?? {})
+      if (entries.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['targetAllocations'],
+          message:
+            'targetAllocations is required when strategyName is TARGET_ALLOCATION',
+        })
+        return
+      }
+      // Followers inherit these weights verbatim, so a set that does not sum to
+      // 100 would quietly under- or over-allocate someone else's funds.
+      const total = entries.reduce((sum, [, weight]) => sum + weight, 0)
+      if (Math.abs(total - 100) > 0.01) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['targetAllocations'],
+          message: `targetAllocations must sum to 100 (got ${total})`,
+        })
+      }
+    }
+  })
+
+/**
+ * POST /strategies/publish
+ *
+ * `strategyConfig` is optional: when omitted the caller's own
+ * User.rebalanceStrategy / User.strategyConfig is snapshotted instead, which is
+ * the "publish what I'm actually running" path. Supplying it explicitly is the
+ * only way to publish anything today, since nothing in src/ writes those User
+ * columns yet.
+ */
+/** Short free-text summary shown alongside a listing (#527). Same self-doxx
+ * screening as label: it is publisher-authored text shown to strangers. */
+export const strategyDescriptionSchema = z
+  .string()
+  .trim()
+  .max(
+    MAX_DESCRIPTION_LENGTH,
+    `description must be at most ${MAX_DESCRIPTION_LENGTH} characters`
+  )
+  .refine((v) => !STELLAR_ADDRESS_PATTERN.test(v), {
+    message:
+      'description must not contain a Stellar address — published strategies are anonymous',
+  })
+  .refine((v) => !LONG_HEX_PATTERN.test(v), {
+    message:
+      'description must not contain long hexadecimal strings — published strategies are anonymous',
+  })
+
+/** Tag slugs, checked against the curated MarketplaceTag vocabulary in
+ * src/strategy/service.ts — this layer only bounds shape/count. */
+export const strategyTagsSchema = z
+  .array(z.string().trim().min(1).max(40))
+  .max(MAX_TAGS, `at most ${MAX_TAGS} tags are allowed`)
+
+export const publishStrategySchema = z.object({
+  label: strategyLabelSchema,
+  strategyConfig: publishableConfigSchema.optional(),
+  description: strategyDescriptionSchema.optional(),
+  tags: strategyTagsSchema.optional(),
+})
+
+/**
+ * GET /strategies/marketplace
+ *
+ * `window` accepts 30d and 90d ONLY. src/agent/snapshotter.ts hard-deletes
+ * YieldSnapshot rows past 90 days, so a longer window has no data behind it and
+ * would return a 90-day figure mislabelled as something else. Rejected with a
+ * 400 that names the retention limit rather than silently downgraded.
+ */
+export const marketplaceQuerySchema = z.object({
+  sortBy: z.enum(MARKETPLACE_SORT_FIELDS).default('sharpe'),
+  window: z
+    .enum(MARKETPLACE_WINDOWS, {
+      error:
+        'window must be "30d" or "90d". Longer windows are unavailable because yield snapshots are retained for 90 days.',
+    })
+    .default('30d'),
+  // Deliberately NOT the shared paginationSchema defaults (limit 5 / max 50):
+  // those are tuned for WhatsApp transaction lists, not a leaderboard page.
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+  // Discovery filters (#527) — riskMax/protocols/type/q are additive; an
+  // empty match still returns unfiltered facet counts (see getMarketplace).
+  riskMax: z.coerce.number().int().min(0).max(100).optional(),
+  protocols: z
+    .string()
+    .optional()
+    .transform((v) => (v ? v.split(',').filter(Boolean) : undefined)),
+  type: z.enum(PUBLISHABLE_STRATEGIES).optional(),
+  tags: z
+    .string()
+    .optional()
+    .transform((v) => (v ? v.split(',').filter(Boolean) : undefined)),
+  q: z.string().trim().max(100).optional(),
+})
+
+/**
+ * Path param for follow/unfollow. This is a PublishedStrategy id, never a
+ * userId — naming it `userId` would hand it to enforceUserAccess, which
+ * compares req.params.userId against the caller and would 403 every follow.
+ */
+export const strategyIdParamSchema = z.object({
+  id: z.string().uuid('Invalid strategy ID'),
+})
+
+/**
+ * POST /strategies/simulate (#344)
+ *
+ * Dry-run a hypothetical strategy config. `followStrategyId` is mutually
+ * exclusive with the inline `strategy`/`targetAllocations`/`riskCeiling`. The
+ * historical replay window is capped at SIMULATE_MAX_WINDOW_DAYS (180) to bound
+ * compute. TARGET_ALLOCATION weight-sum-to-100 is enforced in the service once
+ * the effective config is resolved (a follow may contribute allocations), so it
+ * is not duplicated here.
+ */
+export const strategySimulateSchema = z
+  .object({
+    strategy: z
+      .enum(['MAX_YIELD', 'TARGET_ALLOCATION', 'GOAL_TRACKING'])
+      .nullable()
+      .optional(),
+    targetAllocations: z
+      .record(z.string().min(1).max(100), z.number().finite().min(0).max(100))
+      .optional(),
+    riskCeiling: z.number().int().min(0).max(100).optional(),
+    followStrategyId: z
+      .string()
+      .uuid('Invalid strategy ID')
+      .nullable()
+      .optional(),
+    historyWindowDays: z
+      .number()
+      .int()
+      .min(1)
+      .max(180, 'historyWindowDays is capped at 180 days')
+      .default(90)
+      .optional(),
+    assumeInitialDeposit: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const hasInline =
+      data.strategy != null ||
+      data.targetAllocations !== undefined ||
+      data.riskCeiling !== undefined
+    if (data.followStrategyId && hasInline) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['followStrategyId'],
+        message:
+          'followStrategyId is mutually exclusive with inline strategy config',
+      })
+    }
+  })
+
+export type StrategySimulateInput = z.infer<typeof strategySimulateSchema>
+
+export type PublishStrategyInput = z.infer<typeof publishStrategySchema>
+export type MarketplaceQuery = z.infer<typeof marketplaceQuerySchema>

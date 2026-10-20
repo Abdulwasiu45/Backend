@@ -2,31 +2,61 @@
  * Agent Loop - Main orchestration of scheduled and event-based agent tasks
  */
 
-import cron, { ScheduledTask } from 'node-cron';
-import { logger, logBackgroundJob } from '../utils/logger';
-import { generateCorrelationId, runWithCorrelationIdAsync } from '../utils/correlation';
-import { scanAllProtocols } from './scanner';
-import { executeRebalanceIfNeeded, getThresholds, logAgentAction } from './router';
-import { captureAllUserBalances, cleanupOldSnapshots } from './snapshotter';
-import db from '../db';
+import cron, { ScheduledTask } from 'node-cron'
+import { logger, logBackgroundJob } from '../utils/logger'
 import {
-  updateAgentHeartbeat,
+  generateCorrelationId,
+  runWithCorrelationIdAsync,
+} from '../utils/correlation'
+import { scanAllProtocols } from './scanner'
+import {
+  executeRebalanceIfNeeded,
+  getThresholds,
+  logAgentAction,
+} from './router'
+import { publishUserEvent } from '../events/publisher'
+import { EVENT_TYPE_TOPIC } from '../events/types'
+import { captureAllUserBalances, cleanupOldSnapshots } from './snapshotter'
+import {
+  evaluateBreakerTick,
+  emitBreakerEvalFailureAlert,
+  getBreakerStatusSummary,
+  type BreakerBlockContext,
+} from './breakerService'
+import { persistRebalanceDecision } from './rebalanceDecision'
+import type { DecisionTrace } from './types'
+import { resolveEffectiveConfig } from './effectiveStrategy'
+import {
+  loadActiveFollowsForUsers,
+  type ActiveFollowConfig,
+} from '../strategy/service'
+import type { StrategyName } from './types'
+import { isPortfolioRebalanceAllowed } from './volatilityCircuitBreaker'
+import db from '../db'
+import {
+  updateAgentHeartbeat as metricsUpdateAgentHeartbeat,
   updateAgentStatus,
   recordRebalanceCheck,
   recordRebalanceTriggered,
   recordDbOperation,
   recordBackgroundJob,
-  recordExternalServiceError
-} from '../utils/metrics';
+  recordExternalServiceError,
+} from '../utils/metrics'
 
-let isRunning = false;
-let lastRebalanceAt: Date | null = null;
-let currentProtocol: string | null = null;
-let currentApy: number | null = null;
-let lastError: string | null = null;
+let isRunning = false
+let lastRebalanceAt: Date | null = null
+let currentProtocol: string | null = null
+let currentApy: number | null = null
+let lastError: string | null = null
+let lastTickAt: Date | null = null
 
 // Store cron job references for cleanup
-const cronJobs: ScheduledTask[] = [];
+const cronJobs: ScheduledTask[] = []
+
+function updateAgentHeartbeat(): void {
+  lastTickAt = new Date()
+  metricsUpdateAgentHeartbeat()
+}
 
 /**
  * Get current agent status
@@ -40,16 +70,18 @@ export function getAgentStatus() {
     nextScheduledCheck: getNextCheckTime(),
     lastError,
     healthStatus: determineHealthStatus(),
-  };
+    lastTickAt,
+    breakers: getBreakerStatusSummary(),
+  }
 }
 
 /**
  * Determine agent health status
  */
 function determineHealthStatus(): 'healthy' | 'degraded' | 'error' {
-  if (!isRunning) return 'error';
-  if (lastError) return 'degraded';
-  return 'healthy';
+  if (!isRunning) return 'error'
+  if (lastError) return 'degraded'
+  return 'healthy'
 }
 
 /**
@@ -57,24 +89,24 @@ function determineHealthStatus(): 'healthy' | 'degraded' | 'error' {
  */
 function getNextCheckTime(): Date {
   // Rebalance check runs hourly at :00
-  const now = new Date();
-  const nextHour = new Date(now);
-  nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
-  return nextHour;
+  const now = new Date()
+  const nextHour = new Date(now)
+  nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0)
+  return nextHour
 }
 
 /**
  * Main rebalance check job - runs every hour at :00
  */
 async function rebalanceCheckJob(): Promise<void> {
-  const correlationId = generateCorrelationId();
+  const correlationId = generateCorrelationId()
   return runWithCorrelationIdAsync(correlationId, async () => {
-    const jobName = 'rebalance_check';
-    const startTime = Date.now();
+    const jobName = 'rebalance_check'
+    const startTime = Date.now()
 
     try {
-      logger.info(`[${jobName}] started`, { correlationId });
-      updateAgentHeartbeat();
+      logger.info(`[${jobName}] started`, { correlationId })
+      updateAgentHeartbeat()
 
       const positions = await db.position.findMany({
         where: {
@@ -83,132 +115,437 @@ async function rebalanceCheckJob(): Promise<void> {
         include: {
           user: true,
         },
-      });
+      })
 
       if (positions.length === 0) {
-        const duration = (Date.now() - startTime) / 1000;
+        const duration = (Date.now() - startTime) / 1000
         logBackgroundJob(jobName, 'success', duration, correlationId, {
           positionsChecked: 0,
           rebalancesTriggered: 0,
-        });
-        recordRebalanceCheck('success');
-        return;
+        })
+        recordRebalanceCheck('success')
+        return
       }
 
-      const byProtocol = new Map<string, typeof positions>();
-      for (const pos of positions) {
-        const key = pos.protocolName;
-        if (!byProtocol.has(key)) {
-          byProtocol.set(key, []);
+      type PositionWithUser = (typeof positions)[number]
+
+      // Strategy marketplace (#285): one query for the whole tick, not one per
+      // user. Returns an empty Map when nobody in the batch follows anything —
+      // which is the path every user without a follow takes.
+      const userIds = Array.from(
+        new Set(positions.map((p: PositionWithUser) => p.userId))
+      )
+      const followsByUser = await loadActiveFollowsForUsers(userIds)
+
+      const volatilityAllowedByUser = new Map<string, boolean>()
+      for (const userId of userIds) {
+        volatilityAllowedByUser.set(
+          userId,
+          await isPortfolioRebalanceAllowed(userId)
+        )
+      }
+
+      // Load active goals for all users in one query (#446). Returns empty when
+      // no users have active goals.
+      const goalsByUser = new Map<string, boolean>()
+      const userGoals = await db.savingsGoal.findMany({
+        where: {
+          userId: { in: userIds },
+          status: 'ACTIVE',
+          includeExternalHoldings: false,
+        },
+        select: { userId: true },
+      })
+      for (const goal of userGoals as Array<{ userId: string }>) {
+        goalsByUser.set(goal.userId, true)
+      }
+
+      // Resolve each user's effective config once. With no follow this is the
+      // user's own values read exactly as they were before #285 — the raw
+      // strategyConfig fields, uncoerced — so the no-follow path stays a
+      // byte-for-byte no-op (asserted by the regression test in
+      // tests/integration/agent/strategy-follow.integration.test.ts).
+      const effectiveByUser = new Map<
+        string,
+        {
+          config: ReturnType<typeof resolveEffectiveConfig>
+          follow?: ActiveFollowConfig
         }
-        byProtocol.get(key)!.push(pos);
+      >()
+      for (const pos of positions) {
+        if (effectiveByUser.has(pos.userId)) continue
+        const user = pos.user as any
+        const own = {
+          strategyName: (user.rebalanceStrategy || null) as StrategyName | null,
+          targetAllocations:
+            user.strategyConfig?.targetAllocations || undefined,
+          riskCeiling: user.strategyConfig?.riskCeiling,
+          exposureCaps: user.strategyConfig?.exposureCaps,
+          defaultMaxFraction: user.strategyConfig?.defaultMaxFraction,
+        }
+        const follow = followsByUser.get(pos.userId)
+        effectiveByUser.set(pos.userId, {
+          config: resolveEffectiveConfig(own, follow?.appliedConfig),
+          follow,
+        })
       }
 
-      let rebalancesTriggered = 0;
-      const thresholds = getThresholds();
+      // Group by (protocol, strategy, riskCeiling, followId, hasActiveGoal) so
+      // users with different risk ceilings, follows, or active goals are
+      // evaluated independently. Prevents router.ts from applying user[0]'s
+      // settings to the entire batch (#446).
+      //
+      // Keying on the per-user follow id (not the followed strategy id) is
+      // deliberate: two followers of the SAME strategy can still have different
+      // effective ceilings, because a follow clamps to the stricter of publisher
+      // and follower. It costs some batching; it buys risk correctness.
+      //
+      // For users without a follow the component is the constant 'none'; without
+      // an active goal it is 'false', so grouping is unchanged for the no-follow,
+      // no-goal path.
+      const byProtocolAndStrategy = new Map<
+        string,
+        { protocol: string; positions: PositionWithUser[]; batchKey: string }
+      >()
+      for (const pos of positions) {
+        const { config, follow } = effectiveByUser.get(pos.userId)!
+        const hasGoal = goalsByUser.has(pos.userId)
+        const liquidityFloorConfigured =
+          (pos.user as any).liquidityFloor !== null &&
+          (pos.user as any).liquidityFloor !== undefined
+        const floorUserKey = liquidityFloorConfigured ? pos.userId : 'shared'
+        const key = `${pos.protocolName}:${config.strategyName || 'DEFAULT'}:${
+          config.riskCeiling ?? 'none'
+        }:${follow?.followId ?? 'none'}:${hasGoal ? 'goal' : 'nogoal'}:${floorUserKey}`
+        if (!byProtocolAndStrategy.has(key)) {
+          byProtocolAndStrategy.set(key, {
+            protocol: pos.protocolName,
+            positions: [],
+            batchKey: key,
+          })
+        }
+        byProtocolAndStrategy.get(key)!.positions.push(pos)
+      }
 
-      for (const [protocol, protocolPositions] of byProtocol.entries()) {
+      let rebalancesTriggered = 0
+      const thresholds = getThresholds()
+
+      // #345 Agent circuit breaker — evaluated BEFORE any batch executes.
+      // Order: GLOBAL -> PROTOCOL(from) -> USER. An OPEN breaker at any scope
+      // skips the affected batches and a BLOCKED decision is recorded. On
+      // failure the tick FAILS CLOSED: nothing rebalances and the operator is
+      // alerted — the agent never trades blind when the breaker cannot decide.
+      let breakerCtx: BreakerBlockContext
+      try {
+        breakerCtx = await evaluateBreakerTick(
+          positions.map((p: PositionWithUser) => ({
+            id: p.id,
+            userId: p.userId,
+            protocolName: p.protocolName,
+          })),
+          Array.from(byProtocolAndStrategy.values()).map((b) => ({
+            batchKey: b.batchKey,
+            protocol: b.protocol,
+          })),
+          new Date()
+        )
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error'
+        emitBreakerEvalFailureAlert(message)
+        logger.error(
+          '[Breaker] evaluation failed; halting all rebalancing for the tick',
+          {
+            correlationId,
+            error: message,
+          }
+        )
+        breakerCtx = {
+          globalOpen: true,
+          openProtocols: new Set<string>(),
+          openUsers: new Set<string>(),
+          blockedTargetProtocols: [],
+          trips: [],
+          closes: [],
+          evalFailed: true,
+        }
+      }
+
+      const recordBreakerBlockedDecision = async (
+        batch: {
+          protocol: string
+          batchKey: string
+          positions: PositionWithUser[]
+        },
+        blocking: string[],
+        detail: string
+      ): Promise<void> => {
+        const affectedUserIds = Array.from(
+          new Set(batch.positions.map((p: PositionWithUser) => p.userId))
+        )
+        const trace: DecisionTrace = {
+          currentApy: null,
+          chosenProtocol: null,
+          chosenApy: null,
+          rawImprovement: null,
+          netImprovement: null,
+          estCostPercent: null,
+          costBreakdown: null,
+          thresholds,
+          candidates: [],
+        }
+        await persistRebalanceDecision({
+          batchKey: batch.batchKey,
+          fromProtocol: batch.protocol,
+          outcome: 'BLOCKED',
+          blockedReason: 'circuit_breaker_open',
+          thresholds,
+          trace,
+          rationale: `Skipped by agent circuit breaker (${detail}): ${blocking.join(', ')}`,
+          affectedUserIds,
+          affectedPositions: batch.positions.length,
+        })
+      }
+
+      for (const batch of byProtocolAndStrategy.values()) {
+        const { protocol } = batch
+        const protocolPositions = batch.positions.filter((position) =>
+          volatilityAllowedByUser.get(position.userId)
+        )
+        if (protocolPositions.length === 0) continue
+        const lead = effectiveByUser.get(protocolPositions[0].userId)!
+
+        // #345 — skip batches affected by an OPEN breaker. Precedence:
+        // GLOBAL beats PROTOCOL beats USER; a user's own breaker never helps
+        // them if the whole market is halted. Recorded as a BLOCKED decision
+        // so the explainable-rebalance ledger shows WHY nothing moved.
+        const blocking = breakerCtx.globalOpen
+          ? ['GLOBAL']
+          : [
+              ...(breakerCtx.openProtocols.has(protocol)
+                ? [`PROTOCOL:${protocol}`]
+                : []),
+              ...protocolPositions
+                .filter((p: PositionWithUser) =>
+                  breakerCtx.openUsers.has(p.userId)
+                )
+                .map((p: PositionWithUser) => `USER:${p.userId}`),
+            ]
+
+        if (blocking.length > 0) {
+          await recordBreakerBlockedDecision(
+            batch,
+            blocking,
+            breakerCtx.evalFailed
+              ? 'breaker evaluation failed'
+              : 'open circuit breaker'
+          )
+          continue
+        }
+
+        // HAZARD: this guard used to be `strategyName ? … : undefined`, and
+        // executeRebalanceIfNeeded skips the strategy engine entirely when
+        // preferences are undefined. A follower whose OWN rebalanceStrategy is
+        // null — the common case for a new user, and exactly who this feature
+        // targets — would have had their followed config silently ignored.
+        const hasStrategyContext =
+          Boolean(lead.config.strategyName) ||
+          Boolean(lead.follow) ||
+          ((protocolPositions[0].user as any).liquidityFloor !== null &&
+            (protocolPositions[0].user as any).liquidityFloor !== undefined)
+
+        const userStrategyPreferences = hasStrategyContext
+          ? protocolPositions.map((p: PositionWithUser) => {
+              const { config, follow } = effectiveByUser.get(p.userId)!
+              return {
+                userId: p.userId,
+                strategyName: config.strategyName,
+                targetAllocations: config.targetAllocations,
+                riskTolerance: (p.user as any).riskTolerance,
+                // Opt-in risk ceiling (0-100 min protocol risk score). Absent for
+                // users who never configured one, keeping agent behavior unchanged.
+                // Under a follow this is already clamped to the STRICTER of
+                // publisher and follower — see resolveEffectiveConfig.
+                riskCeiling: config.riskCeiling,
+                // Exposure caps (#346): per-protocol overrides + user default
+                // fraction, resolved (tighten-only under a follow) by
+                // resolveEffectiveConfig. Absent for users who never configured
+                // them.
+                exposureCaps: config.exposureCaps,
+                defaultMaxFraction: config.defaultMaxFraction,
+                ...((p.user as any).liquidityFloor === null ||
+                (p.user as any).liquidityFloor === undefined
+                  ? {}
+                  : {
+                      liquidityFloorUsd: Number((p.user as any).liquidityFloor),
+                    }),
+                followedStrategyId: follow?.followedStrategyId ?? undefined,
+              }
+            })
+          : undefined
+
         const result = await executeRebalanceIfNeeded(
           protocol,
           protocolPositions.map((p: any) => ({
             id: p.id,
             amount: p.currentValue.toString(),
+            userId: p.userId,
           })),
-          thresholds
-        );
+          thresholds,
+          userStrategyPreferences,
+          {
+            batchKey: batch.batchKey,
+            strategyName: lead.config.strategyName ?? null,
+            strategyIsFollowed: Boolean(lead.follow),
+            followedStrategyId: lead.follow?.followedStrategyId ?? null,
+            blockedProtocols: breakerCtx.blockedTargetProtocols,
+          }
+        )
 
         if (result) {
-          rebalancesTriggered++;
-          lastRebalanceAt = new Date();
-          currentProtocol = result.toProtocol;
-          currentApy = result.improvedBy;
-          recordRebalanceTriggered();
+          rebalancesTriggered++
+          lastRebalanceAt = new Date()
+          currentProtocol = result.toProtocol
+          currentApy = result.improvedBy
+          recordRebalanceTriggered()
+
+          // #316: every user with a position in this batch had their money
+          // moved, so each gets the event on their own stream. The operator
+          // webhook still fires exactly once — webhook subscriptions are
+          // operator-scoped, not per-user, so fanning it out would duplicate it.
+          const affectedUserIds = Array.from(
+            new Set(protocolPositions.map((p: PositionWithUser) => p.userId))
+          )
+          const rebalancePayload = {
+            fromProtocol: result.fromProtocol,
+            toProtocol: result.toProtocol,
+            amount: result.amount,
+            improvedBy: result.improvedBy,
+            txHash: result.txHash,
+            timestamp: result.timestamp,
+          }
+
+          publishUserEvent(
+            affectedUserIds,
+            EVENT_TYPE_TOPIC['agent.rebalanced'],
+            'agent.rebalanced',
+            rebalancePayload
+          ).catch(() => {})
+
+          // Companion socket-only signal: a dashboard watching `portfolio`
+          // should refresh without also subscribing to agent internals. No
+          // webhook counterpart — an operator endpoint already got the
+          // rebalance above, and a second near-identical POST helps nobody.
+          publishUserEvent(
+            affectedUserIds,
+            EVENT_TYPE_TOPIC['portfolio.updated'],
+            'portfolio.updated',
+            {
+              protocolName: result.toProtocol,
+              positionsAffected: protocolPositions.length,
+              reason: 'rebalance',
+            }
+          ).catch(() => {})
         }
       }
 
-      const duration = (Date.now() - startTime) / 1000;
+      const duration = (Date.now() - startTime) / 1000
 
       await logAgentAction('ANALYZE', 'SUCCESS', {
-        input: { correlationId, positionsChecked: positions.length, rebalancesTriggered, duration },
-      });
+        input: {
+          correlationId,
+          positionsChecked: positions.length,
+          rebalancesTriggered,
+          duration,
+          breakers: {
+            globalOpen: breakerCtx.globalOpen,
+            evalFailed: breakerCtx.evalFailed,
+            trips: breakerCtx.trips.map(
+              (t) => `${t.scope}:${t.scopeKey}:${t.rule}`
+            ),
+            closes: breakerCtx.closes.map((c) => `${c.scope}:${c.scopeKey}`),
+          },
+        },
+      })
 
       logBackgroundJob(jobName, 'success', duration, correlationId, {
         positionsChecked: positions.length,
         rebalancesTriggered,
-      });
+      })
 
-      recordRebalanceCheck('success');
-      recordDbOperation('rebalance_check', duration);
+      recordRebalanceCheck('success')
+      recordDbOperation('rebalance_check', duration)
 
-      lastError = null;
+      lastError = null
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      lastError = errorMessage;
-      const duration = (Date.now() - startTime) / 1000;
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error'
+      lastError = errorMessage
+      const duration = (Date.now() - startTime) / 1000
 
       logBackgroundJob(jobName, 'failed', duration, correlationId, {
         error: errorMessage,
-      });
+      })
 
-      recordRebalanceCheck('failed');
-      recordDbOperation('rebalance_check', duration);
+      recordRebalanceCheck('failed')
+      recordDbOperation('rebalance_check', duration)
 
       await logAgentAction('ANALYZE', 'FAILED', {
         input: { correlationId },
         error: errorMessage,
-      });
+      })
     }
-  });
+  })
 }
 
 /**
  * Snapshot job - runs every hour at :30
  */
 async function snapshotJob(): Promise<void> {
-  const correlationId = generateCorrelationId();
+  const correlationId = generateCorrelationId()
   return runWithCorrelationIdAsync(correlationId, async () => {
-  const jobName = 'Hourly Balance Snapshot';
-  const startTime = Date.now();
+    const jobName = 'Hourly Balance Snapshot'
+    const startTime = Date.now()
 
-  try {
-    logger.info(`${jobName} started`, { correlationId });
-    // Update heartbeat
-    updateAgentHeartbeat();
+    try {
+      logger.info(`${jobName} started`, { correlationId })
+      // Update heartbeat
+      updateAgentHeartbeat()
 
-    // Run snapshot in background to avoid blocking rebalance checks
-    captureAllUserBalances().catch(error => {
-      logger.error('Background snapshot failed', {
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-    });
-
-    // Run cleanup in background (once per day at :30 past 1 AM)
-    const now = new Date();
-    if (now.getHours() === 1) {
-      cleanupOldSnapshots().catch(error => {
-        logger.error('Snapshot cleanup background job failed', {
+      // Run snapshot in background to avoid blocking rebalance checks
+      captureAllUserBalances().catch((error) => {
+        logger.error('Background snapshot failed', {
           error: error instanceof Error ? error.message : 'Unknown error',
-        });
-      });
-    }
+        })
+      })
 
-    const duration = Date.now() - startTime;
-    // Record Prometheus metrics
-    recordDbOperation('snapshot_job', duration / 1000);
-    recordBackgroundJob('snapshot', 'success', duration / 1000);
-    logger.info(`${jobName} scheduled`, { duration });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    const duration = Date.now() - startTime;
-    logger.error(`${jobName} failed`, {
-      error: errorMessage,
-      duration,
-    });
-    // Record Prometheus metrics
-    recordDbOperation('snapshot_job', duration / 1000);
-    recordBackgroundJob('snapshot', 'failed', duration / 1000);
-  }
-  });
+      // Run cleanup in background (once per day at :30 past 1 AM)
+      const now = new Date()
+      if (now.getHours() === 1) {
+        cleanupOldSnapshots().catch((error) => {
+          logger.error('Snapshot cleanup background job failed', {
+            error: error instanceof Error ? error.message : 'Unknown error',
+          })
+        })
+      }
+
+      const duration = Date.now() - startTime
+      // Record Prometheus metrics
+      recordDbOperation('snapshot_job', duration / 1000)
+      recordBackgroundJob('snapshot', 'success', duration / 1000)
+      logger.info(`${jobName} scheduled`, { duration })
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : 'Unknown error'
+      const duration = Date.now() - startTime
+      logger.error(`${jobName} failed`, {
+        error: errorMessage,
+        duration,
+      })
+      // Record Prometheus metrics
+      recordDbOperation('snapshot_job', duration / 1000)
+      recordBackgroundJob('snapshot', 'failed', duration / 1000)
+    }
+  })
 }
 
 /**
@@ -217,81 +554,82 @@ async function snapshotJob(): Promise<void> {
  */
 export async function startAgentLoop(): Promise<void> {
   if (isRunning) {
-    logger.warn('Agent loop already running');
-    return;
+    logger.warn('Agent loop already running')
+    return
   }
 
   try {
-    logger.info('🤖 Starting NeuroWealth Agent Loop');
+    logger.info('🤖 Starting NeuroWealth Agent Loop')
     // Update Prometheus metrics
-    updateAgentStatus('running');
-    updateAgentHeartbeat();
+    updateAgentStatus('running')
+    updateAgentHeartbeat()
 
     // Run jobs immediately on startup
-    logger.info('Running initial jobs...');
-    await rebalanceCheckJob();
-    await snapshotJob();
+    logger.info('Running initial jobs...')
+    await rebalanceCheckJob()
+    await snapshotJob()
 
     // Schedule hourly rebalance check at :00
     const rebalanceJob = cron.schedule('0 * * * *', async () => {
-      await rebalanceCheckJob();
-    });
-    cronJobs.push(rebalanceJob);
-    logger.info('✓ Rebalance check scheduled: Every hour at :00');
+      await rebalanceCheckJob()
+    })
+    cronJobs.push(rebalanceJob)
+    logger.info('✓ Rebalance check scheduled: Every hour at :00')
 
     // Schedule hourly snapshot at :30
     const snapJob = cron.schedule('30 * * * *', async () => {
-      await snapshotJob();
-    });
-    cronJobs.push(snapJob);
-    logger.info('✓ Balance snapshot scheduled: Every hour at :30');
+      await snapshotJob()
+    })
+    cronJobs.push(snapJob)
+    logger.info('✓ Balance snapshot scheduled: Every hour at :30')
 
     // Daily protocol scan at 2 AM
     const scanJob = cron.schedule('0 2 * * *', async () => {
-      const correlationId = generateCorrelationId();
+      const correlationId = generateCorrelationId()
       return runWithCorrelationIdAsync(correlationId, async () => {
-      try {
-        logger.info('Daily protocol scan started', { correlationId });
-        updateAgentHeartbeat();
-        const scanStart = Date.now();
-        const protocols = await scanAllProtocols();
-        const scanDuration = (Date.now() - scanStart) / 1000;
-        await logAgentAction('SCAN', 'SUCCESS', {
-          input: { correlationId, protocolsScanned: protocols.length },
-        });
-        recordBackgroundJob('protocol_scan', 'success', scanDuration);
-        logger.info('Daily protocol scan complete', {
-          correlationId,
-          protocolsScanned: protocols.length,
-        });
-      } catch (error) {
-        logger.error('Daily protocol scan failed', {
-          correlationId,
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
-        recordBackgroundJob('protocol_scan', 'failed', 0);
-        await logAgentAction('SCAN', 'FAILED', {
-          input: { correlationId },
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
-      }
-      });
-    });
-    cronJobs.push(scanJob);
-    logger.info('✓ Daily protocol scan scheduled: Daily at 2 AM');
+        try {
+          logger.info('Daily protocol scan started', { correlationId })
+          updateAgentHeartbeat()
+          const scanStart = Date.now()
+          const protocols = await scanAllProtocols()
+          const scanDuration = (Date.now() - scanStart) / 1000
+          await logAgentAction('SCAN', 'SUCCESS', {
+            input: { correlationId, protocolsScanned: protocols.length },
+          })
+          recordBackgroundJob('protocol_scan', 'success', scanDuration)
+          logger.info('Daily protocol scan complete', {
+            correlationId,
+            protocolsScanned: protocols.length,
+          })
+        } catch (error) {
+          logger.error('Daily protocol scan failed', {
+            correlationId,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          })
+          recordBackgroundJob('protocol_scan', 'failed', 0)
+          await logAgentAction('SCAN', 'FAILED', {
+            input: { correlationId },
+            error: error instanceof Error ? error.message : 'Unknown error',
+          })
+        }
+      })
+    })
+    cronJobs.push(scanJob)
+    logger.info('✓ Daily protocol scan scheduled: Daily at 2 AM')
 
-    isRunning = true;
-    logger.info('✅ NeuroWealth Agent Loop started successfully');
+    isRunning = true
+    logger.info('✅ NeuroWealth Agent Loop started successfully')
 
     // Setup graceful shutdown
-    setupGracefulShutdown();
+    setupGracefulShutdown()
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    lastError = errorMessage;
+    const errorMessage =
+      error instanceof Error ? error.message : 'Unknown error'
+    lastError = errorMessage
     // Update Prometheus metrics for error state
-    updateAgentStatus('degraded');
-    logger.error('Failed to start agent loop', { error: errorMessage });
-    throw error;
+    updateAgentStatus('degraded')
+    logger.error('Failed to start agent loop', { error: errorMessage })
+    throw error
   }
 }
 
@@ -300,26 +638,27 @@ export async function startAgentLoop(): Promise<void> {
  */
 export async function stopAgentLoop(): Promise<void> {
   if (!isRunning) {
-    logger.warn('Agent loop is not running');
-    return;
+    logger.warn('Agent loop is not running')
+    return
   }
 
   try {
-    logger.info('Stopping NeuroWealth Agent Loop...');
+    logger.info('Stopping NeuroWealth Agent Loop...')
 
-    // Stop all cron jobs
-    cronJobs.forEach(job => {
-      job.stop();
-      job.destroy();
-    });
-    cronJobs.length = 0;
+    // Stop all cron jobs. node-cron@3's ScheduledTask exposes stop() only
+    // (destroy() was added in v4); stopping and dropping our references is
+    // enough for the jobs to be GC'd.
+    cronJobs.forEach((job) => {
+      job.stop()
+    })
+    cronJobs.length = 0
 
-    isRunning = false;
-    logger.info('✅ Agent loop stopped gracefully');
+    isRunning = false
+    logger.info('✅ Agent loop stopped gracefully')
   } catch (error) {
     logger.error('Error stopping agent loop', {
       error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    })
   }
 }
 
@@ -328,23 +667,22 @@ export async function stopAgentLoop(): Promise<void> {
  */
 function setupGracefulShutdown(): void {
   // Handle uncaught exceptions
-  process.on('uncaughtException', error => {
+  process.on('uncaughtException', (error) => {
     logger.error('Uncaught exception in agent', {
       error: error instanceof Error ? error.message : String(error),
-    });
-    lastError = error instanceof Error ? error.message : 'Uncaught exception';
-  });
+    })
+    lastError = error instanceof Error ? error.message : 'Uncaught exception'
+  })
 
-  process.on('unhandledRejection', reason => {
+  process.on('unhandledRejection', (reason) => {
     logger.error('Unhandled rejection in agent', {
       reason: reason instanceof Error ? reason.message : String(reason),
-    });
-    lastError =
-      reason instanceof Error ? reason.message : 'Unhandled rejection';
-  });
+    })
+    lastError = reason instanceof Error ? reason.message : 'Unhandled rejection'
+  })
 }
 
 /**
  * Export for testing
  */
-export { rebalanceCheckJob, snapshotJob };
+export { rebalanceCheckJob, snapshotJob }

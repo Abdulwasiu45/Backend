@@ -1,6 +1,13 @@
 import { Request, Response, NextFunction } from 'express'
+import { ZodError } from 'zod'
 import { logger } from '../utils/logger'
-import { ErrorResponses } from '../utils/errorResponse'
+import {
+  ErrorCodes,
+  buildErrorResponse,
+  codeForStatus,
+  messageForStatus,
+} from '../utils/errorResponse'
+import { formatZodErrors } from './validate'
 import { trace, SpanStatusCode } from '@opentelemetry/api'
 import { Sentry } from '../telemetry/sentry'
 
@@ -8,14 +15,23 @@ import { Sentry } from '../telemetry/sentry'
 // Helper: determine the HTTP status code from an error object.
 //
 // Supports express-style errors that carry `.status` or `.statusCode`.
-// Falls back to 500 for anything we don't recognise.
+// Falls back to 500 for anything we don't recognise or that is not a valid
+// error status (a thrown `{ status: 200 }` must never produce a success).
 // ---------------------------------------------------------------------------
 
 function resolveStatusCode(err: unknown): number {
+  if (err instanceof ZodError) return 400
   if (err && typeof err === 'object') {
     const e = err as Record<string, unknown>
-    if (typeof e['status'] === 'number') return e['status'] as number
-    if (typeof e['statusCode'] === 'number') return e['statusCode'] as number
+    const candidate =
+      typeof e['status'] === 'number'
+        ? (e['status'] as number)
+        : typeof e['statusCode'] === 'number'
+          ? (e['statusCode'] as number)
+          : undefined
+    if (candidate !== undefined && candidate >= 400 && candidate <= 599) {
+      return candidate
+    }
   }
   return 500
 }
@@ -29,6 +45,39 @@ function isClientError(statusCode: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: map a client error to a safe code, message and details.
+// ---------------------------------------------------------------------------
+
+function describeClientError(
+  err: Error,
+  statusCode: number
+): { code: string; message: string; details?: unknown } {
+  if (err instanceof ZodError) {
+    return {
+      code: ErrorCodes.VALIDATION_ERROR,
+      message: 'Validation failed',
+      details: formatZodErrors(err),
+    }
+  }
+
+  const e = err as Error & { type?: string; code?: unknown; details?: unknown }
+
+  // body-parser: malformed JSON — its message echoes parser internals
+  if (e.type === 'entity.parse.failed') {
+    return {
+      code: ErrorCodes.BAD_REQUEST,
+      message: 'Malformed JSON request body',
+    }
+  }
+
+  return {
+    code: typeof e.code === 'string' ? e.code : codeForStatus(statusCode),
+    message: err.message || 'Request failed',
+    ...(e.details !== undefined && { details: e.details }),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Error handler middleware
 // ---------------------------------------------------------------------------
 
@@ -36,9 +85,13 @@ export function errorHandler(
   err: Error,
   req: Request,
   res: Response,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _next: NextFunction
+  next: NextFunction
 ): void {
+  // Response already streaming — let Express close the connection.
+  if (res.headersSent) {
+    return next(err)
+  }
+
   const requestId = req.correlationId
   const statusCode = resolveStatusCode(err)
 
@@ -57,9 +110,15 @@ export function errorHandler(
   }
 
   if (isClientError(statusCode)) {
-    logger.warn(`[ErrorHandler] Client error ${statusCode}: ${err.message}`, logMeta)
+    logger.warn(
+      `[ErrorHandler] Client error ${statusCode}: ${err.message}`,
+      logMeta
+    )
   } else {
-    logger.error(`[ErrorHandler] Server error ${statusCode}: ${err.message}`, logMeta)
+    logger.error(
+      `[ErrorHandler] Server error ${statusCode}: ${err.message}`,
+      logMeta
+    )
   }
 
   // ── OpenTelemetry — mark the active span as failed ────────────────────────
@@ -85,7 +144,7 @@ export function errorHandler(
     activeSpan.setAttribute('error.type', err.constructor.name)
 
     if (requestId) {
-      activeSpan.setAttribute('correlation.id', requestId ?? 'unknown')
+      activeSpan.setAttribute('correlation.id', requestId)
     }
   }
 
@@ -98,13 +157,14 @@ export function errorHandler(
   if (!isClientError(statusCode)) {
     // Attach request context so the Sentry issue shows who was affected
     Sentry.withScope((scope) => {
-      const user = (req as Request & { user?: { id: string; phone?: string } }).user
+      const user = (req as Request & { user?: { id: string; phone?: string } })
+        .user
 
       if (user?.id) {
         scope.setUser({ id: user.id, phone: user.phone })
       }
 
-      scope.setTag('correlation_id', requestId ?? 'unknown')  
+      scope.setTag('correlation_id', requestId ?? 'unknown')
       scope.setTag('http.method', req.method)
       scope.setTag('http.route', req.route?.path ?? req.path)
       scope.setTag('status_code', String(statusCode))
@@ -121,14 +181,30 @@ export function errorHandler(
   }
 
   // ── HTTP response ──────────────────────────────────────────────────────────
+  //
+  // 4xx: the error message is intended for the client.
+  // 5xx: never expose err.message or the stack — the requestId is the handle
+  //      for looking the failure up in logs, traces and Sentry.
 
   const isDevelopment = process.env.NODE_ENV === 'development'
 
-  const errorResponse = ErrorResponses.internalError(
-    isClientError(statusCode) ? err.message : 'Internal server error',
-    requestId ?? 'unknown',
-    isDevelopment ? { message: err.message } : undefined
-  )
+  const { code, message, details } = isClientError(statusCode)
+    ? describeClientError(err, statusCode)
+    : {
+        code: codeForStatus(statusCode),
+        message: messageForStatus(statusCode),
+        details: isDevelopment ? { message: err.message } : undefined,
+      }
 
-  res.status(statusCode).json(errorResponse)
+  res
+    .status(statusCode)
+    .json(
+      buildErrorResponse(
+        statusCode,
+        code,
+        message,
+        requestId ?? 'unknown',
+        details
+      )
+    )
 }

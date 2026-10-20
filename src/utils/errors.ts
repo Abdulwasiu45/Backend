@@ -1,4 +1,5 @@
 import { Response } from 'express'
+import { buildErrorResponse, codeForStatus } from './errorResponse'
 
 export class AppError extends Error {
   constructor(
@@ -11,11 +12,23 @@ export class AppError extends Error {
   }
 }
 
-export const sendError = (res: Response, statusCode: number, message: string, details?: any) => {
-  return res.status(statusCode).json({
-    error: message,
-    details,
-  })
+export const sendError = (
+  res: Response,
+  statusCode: number,
+  message: string,
+  details?: any
+) => {
+  return res
+    .status(statusCode)
+    .json(
+      buildErrorResponse(
+        statusCode,
+        codeForStatus(statusCode),
+        message,
+        (res.locals?.correlationId as string | undefined) ?? 'unknown',
+        details
+      )
+    )
 }
 
 export const sendNotFound = (res: Response, resource: string = 'Resource') => {

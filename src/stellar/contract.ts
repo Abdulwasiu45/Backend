@@ -8,84 +8,127 @@ import {
   xdr,
   scValToNative,
   nativeToScVal,
-} from '@stellar/stellar-sdk';
-import { getRpcServer, getNetworkPassphrase, getAgentKeypair, submitTransaction, waitForConfirmation, simulateTransaction, prepareTransaction, getAccount } from './client';
-import { getKeypairForUser } from './wallet';
-import { config } from '../config';
-import { OnChainBalance, TransactionResult } from './types';
+} from '@stellar/stellar-sdk'
+import {
+  getRpcServer,
+  getNetworkPassphrase,
+  getAgentKeypair,
+  submitTransaction,
+  waitForConfirmation,
+  simulateTransaction,
+  prepareTransaction,
+  getAccount,
+} from './client'
+import { getKeypairForUser } from './wallet'
+import { config } from '../config'
+import { OnChainBalance, TransactionResult } from './types'
+import {
+  MAX_CONTRACT_AMOUNT,
+  STROOPS_PER_TOKEN,
+} from '../config/financial-limits'
 
-const VAULT_CONTRACT_ID = config.stellar.vaultContractId;
-const STROOPS_PER_TOKEN = 10_000_000n;
+const VAULT_CONTRACT_ID = config.stellar.vaultContractId
 
-export type VaultWriteMethod = 'deposit' | 'withdraw';
+export type VaultWriteMethod = 'deposit' | 'withdraw'
 
 /**
  * Get vault contract instance
  */
 function getVaultContract(): Contract {
   if (!VAULT_CONTRACT_ID) {
-    throw new Error('VAULT_CONTRACT_ID not configured');
+    throw new Error('VAULT_CONTRACT_ID not configured')
   }
-  return new Contract(VAULT_CONTRACT_ID);
+  return new Contract(VAULT_CONTRACT_ID)
 }
 
 /**
- * Build contract invocation transaction
+ * Build contract invocation transaction.
+ *
+ * `feeMultiplier` scales the base fee (default 1x). The outbox dispatcher
+ * (#325) resubmits a congested-network op at a higher multiplier — fee-bump
+ * strategy documented in docs/OUTBOX.md — up to a configured cap.
  */
 async function buildContractCall(
   method: string,
   args: xdr.ScVal[],
   sourcePublicKey: string = getAgentKeypair().publicKey(),
+  feeMultiplier: number = 1
 ): Promise<Transaction> {
-  const server = getRpcServer();
-  const contract = getVaultContract();
-  const account = await getAccount(sourcePublicKey);
+  const server = getRpcServer()
+  const contract = getVaultContract()
+  const account = await getAccount(sourcePublicKey)
+  const fee =
+    feeMultiplier === 1
+      ? BASE_FEE
+      : String(
+          BigInt(BASE_FEE) * BigInt(Math.max(1, Math.round(feeMultiplier)))
+        )
 
   const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
+    fee,
     networkPassphrase: getNetworkPassphrase(),
   })
     .addOperation(contract.call(method, ...args))
     .setTimeout(30)
-    .build();
-  return tx;
+    .build()
+  return tx
 }
 
 function toContractAmount(amount: number): bigint {
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw new Error('Amount must be a positive number');
+  const stroops = amount * STROOPS_PER_TOKEN
+  if (
+    !Number.isFinite(amount) ||
+    amount <= 0 ||
+    amount > MAX_CONTRACT_AMOUNT ||
+    !Number.isSafeInteger(stroops)
+  ) {
+    throw new Error(
+      `Amount must be finite, positive, and no greater than ${MAX_CONTRACT_AMOUNT}`
+    )
   }
 
-  return BigInt(Math.round(amount * Number(STROOPS_PER_TOKEN)));
+  return BigInt(stroops)
 }
 
 async function executeWriteContractCall(
   method: string,
   args: xdr.ScVal[],
   signer: Keypair,
+  feeMultiplier: number = 1,
+  onSubmitted?: (txHash: string) => Promise<void>
 ): Promise<TransactionResult> {
-  const tx = await buildContractCall(method, args, signer.publicKey());
+  const tx = await buildContractCall(
+    method,
+    args,
+    signer.publicKey(),
+    feeMultiplier
+  )
 
   // Pre-Transaction Simulation & Validation (Issue #58)
-  const simulation = await simulateTransaction(tx);
+  const simulation = await simulateTransaction(tx)
   if (rpc.Api.isSimulationError(simulation)) {
-    throw new Error(`Transaction simulation failed for ${method}: ${simulation.error}`);
+    throw new Error(
+      `Transaction simulation failed for ${method}: ${simulation.error}`
+    )
   }
   if (!simulation.result) {
-    throw new Error(`Transaction simulation failed for ${method}: No result returned from simulation`);
+    throw new Error(
+      `Transaction simulation failed for ${method}: No result returned from simulation`
+    )
   }
 
-  const prepared = await prepareTransaction(tx);
-  prepared.sign(signer);
+  const prepared = await prepareTransaction(tx)
+  prepared.sign(signer)
 
-  const txHash = await submitTransaction(prepared);
-  const result = await waitForConfirmation(txHash);
+  const txHash = await submitTransaction(prepared)
+  await onSubmitted?.(txHash)
+  const result = await waitForConfirmation(txHash)
 
   if (result.status !== 'success') {
-    throw new Error(`Transaction ${method} failed on-chain`);
+    throw new Error(`Transaction ${method} failed on-chain`)
   }
 
-  return result;
+  return result
 }
 
 /**
@@ -102,60 +145,73 @@ async function executeCustodialVaultOperation(
   userAddress: string,
   amount: number,
   assetSymbol: string,
+  feeMultiplier: number = 1,
+  onSubmitted?: (txHash: string) => Promise<void>
 ): Promise<TransactionResult> {
-  const signer = await getKeypairForUser(userId);
-  const userScVal = nativeToScVal(userAddress, { type: 'address' });
-  const amountScVal = nativeToScVal(toContractAmount(amount), { type: 'i128' });
-  const assetScVal = nativeToScVal(assetSymbol, { type: 'string' });
+  const signer = await getKeypairForUser(userId)
+  const userScVal = nativeToScVal(userAddress, { type: 'address' })
+  const amountScVal = nativeToScVal(toContractAmount(amount), { type: 'i128' })
+  const assetScVal = nativeToScVal(assetSymbol, { type: 'string' })
 
-  return executeWriteContractCall(method, [userScVal, amountScVal, assetScVal], signer);
+  return executeWriteContractCall(
+    method,
+    [userScVal, amountScVal, assetScVal],
+    signer,
+    feeMultiplier,
+    onSubmitted
+  )
 }
 
 /**
  * Simulate and parse contract read call
  */
-async function simulateRead(method: string, args: xdr.ScVal[] = []): Promise<any> {
-  const tx = await buildContractCall(method, args);
-  
-  const simulation = await simulateTransaction(tx);
-  
+async function simulateRead(
+  method: string,
+  args: xdr.ScVal[] = []
+): Promise<any> {
+  const tx = await buildContractCall(method, args)
+
+  const simulation = await simulateTransaction(tx)
+
   if (rpc.Api.isSimulationError(simulation)) {
-    throw new Error(`Simulation failed: ${simulation.error}`);
+    throw new Error(`Simulation failed: ${simulation.error}`)
   }
-  
+
   if (!simulation.result) {
-    throw new Error('No result from simulation');
+    throw new Error('No result from simulation')
   }
-  
-  return scValToNative(simulation.result.retval);
+
+  return scValToNative(simulation.result.retval)
 }
 
 /**
  * Get on-chain balance for user
  */
-export async function getOnChainBalance(userAddress: string): Promise<OnChainBalance> {
-  const addressScVal = nativeToScVal(userAddress, { type: 'address' });
-  const result = await simulateRead('get_balance', [addressScVal]);
-  
+export async function getOnChainBalance(
+  userAddress: string
+): Promise<OnChainBalance> {
+  const addressScVal = nativeToScVal(userAddress, { type: 'address' })
+  const result = await simulateRead('get_balance', [addressScVal])
+
   return {
     balance: result.balance?.toString() || '0',
     shares: result.shares?.toString() || '0',
-  };
+  }
 }
 
 /**
  * Get current APY from vault
  */
 export async function getOnChainAPY(): Promise<number> {
-  const apyBasisPoints = await simulateRead('get_apy');
-  return apyBasisPoints / 100; // Convert basis points to percentage
+  const apyBasisPoints = await simulateRead('get_apy')
+  return apyBasisPoints / 100 // Convert basis points to percentage
 }
 
 /**
  * Get active protocol
  */
 export async function getActiveProtocol(): Promise<string> {
-  return await simulateRead('get_active_protocol');
+  return await simulateRead('get_active_protocol')
 }
 
 /**
@@ -163,23 +219,70 @@ export async function getActiveProtocol(): Promise<string> {
  */
 export async function triggerRebalance(
   protocol: string,
-  expectedApyBasisPoints: number
+  expectedApyBasisPoints: number,
+  feeMultiplier: number = 1,
+  onSubmitted?: (txHash: string) => Promise<void>
 ): Promise<TransactionResult> {
-  const protocolScVal = nativeToScVal(protocol, { type: 'string' });
-  const apyScVal = nativeToScVal(expectedApyBasisPoints, { type: 'u32' });
-  const keypair = getAgentKeypair();
+  const protocolScVal = nativeToScVal(protocol, { type: 'string' })
+  const apyScVal = nativeToScVal(expectedApyBasisPoints, { type: 'u32' })
+  const keypair = getAgentKeypair()
 
-  return executeWriteContractCall('rebalance', [protocolScVal, apyScVal], keypair);
+  return executeWriteContractCall(
+    'rebalance',
+    [protocolScVal, apyScVal],
+    keypair,
+    feeMultiplier,
+    onSubmitted
+  )
 }
 
 /**
  * Update total assets (agent only)
  */
-export async function updateTotalAssets(newTotalStroops: string): Promise<TransactionResult> {
-  const amountScVal = nativeToScVal(BigInt(newTotalStroops), { type: 'i128' });
-  const keypair = getAgentKeypair();
+export async function updateTotalAssets(
+  newTotalStroops: string
+): Promise<TransactionResult> {
+  const amountScVal = nativeToScVal(BigInt(newTotalStroops), { type: 'i128' })
+  const keypair = getAgentKeypair()
 
-  return executeWriteContractCall('update_total_assets', [amountScVal], keypair);
+  return executeWriteContractCall('update_total_assets', [amountScVal], keypair)
+}
+
+/**
+ * Pay a referral reward into a user's wallet (agent-signed, platform-funded).
+ *
+ * Reuses the same on-chain write path as withdrawals/rebalancing
+ * (executeWriteContractCall) rather than introducing a second money-movement
+ * mechanism. The reward moves platform/treasury funds to `recipientAddress`;
+ * it is NOT a withdrawal of the user's own capital.
+ *
+ * The contract method name is configurable (config.referral.rewardContractMethod)
+ * so this backend does not hard-code a method that may be renamed in the
+ * contract repo. Signed by the agent keypair.
+ *
+ * @returns the TransactionResult; caller records the resulting txHash on the
+ *          ReferralConversion. Throws on simulation/submission failure so the
+ *          caller can leave the payout in a retriable state.
+ */
+export async function payReferralReward(
+  recipientAddress: string,
+  amount: number,
+  assetSymbol: string,
+  feeMultiplier: number = 1,
+  onSubmitted?: (txHash: string) => Promise<void>
+): Promise<TransactionResult> {
+  const recipientScVal = nativeToScVal(recipientAddress, { type: 'address' })
+  const amountScVal = nativeToScVal(toContractAmount(amount), { type: 'i128' })
+  const assetScVal = nativeToScVal(assetSymbol, { type: 'string' })
+  const keypair = getAgentKeypair()
+
+  return executeWriteContractCall(
+    config.referral.rewardContractMethod,
+    [recipientScVal, amountScVal, assetScVal],
+    keypair,
+    feeMultiplier,
+    onSubmitted
+  )
 }
 
 /**
@@ -189,9 +292,9 @@ export async function deposit(
   userId: string,
   userAddress: string,
   amount: number,
-  assetSymbol: string,
+  assetSymbol: string
 ): Promise<TransactionResult> {
-  return depositForUser(userId, userAddress, amount, assetSymbol);
+  return depositForUser(userId, userAddress, amount, assetSymbol)
 }
 
 export async function depositForUser(
@@ -199,8 +302,18 @@ export async function depositForUser(
   userAddress: string,
   amount: number,
   assetSymbol: string,
+  feeMultiplier: number = 1,
+  onSubmitted?: (txHash: string) => Promise<void>
 ): Promise<TransactionResult> {
-  return executeCustodialVaultOperation('deposit', userId, userAddress, amount, assetSymbol);
+  return executeCustodialVaultOperation(
+    'deposit',
+    userId,
+    userAddress,
+    amount,
+    assetSymbol,
+    feeMultiplier,
+    onSubmitted
+  )
 }
 
 /**
@@ -210,9 +323,9 @@ export async function withdraw(
   userId: string,
   userAddress: string,
   amount: number,
-  assetSymbol: string,
+  assetSymbol: string
 ): Promise<TransactionResult> {
-  return withdrawForUser(userId, userAddress, amount, assetSymbol);
+  return withdrawForUser(userId, userAddress, amount, assetSymbol)
 }
 
 export async function withdrawForUser(
@@ -220,8 +333,18 @@ export async function withdrawForUser(
   userAddress: string,
   amount: number,
   assetSymbol: string,
+  feeMultiplier: number = 1,
+  onSubmitted?: (txHash: string) => Promise<void>
 ): Promise<TransactionResult> {
-  return executeCustodialVaultOperation('withdraw', userId, userAddress, amount, assetSymbol);
+  return executeCustodialVaultOperation(
+    'withdraw',
+    userId,
+    userAddress,
+    amount,
+    assetSymbol,
+    feeMultiplier,
+    onSubmitted
+  )
 }
 
 /**
@@ -233,24 +356,32 @@ export async function buildUnsignedVaultTransaction(
   method: VaultWriteMethod,
   userAddress: string,
   amount: number,
-  assetSymbol: string,
+  assetSymbol: string
 ): Promise<string> {
-  const userScVal = nativeToScVal(userAddress, { type: 'address' });
-  const amountScVal = nativeToScVal(toContractAmount(amount), { type: 'i128' });
-  const assetScVal = nativeToScVal(assetSymbol, { type: 'string' });
+  const userScVal = nativeToScVal(userAddress, { type: 'address' })
+  const amountScVal = nativeToScVal(toContractAmount(amount), { type: 'i128' })
+  const assetScVal = nativeToScVal(assetSymbol, { type: 'string' })
 
-  const tx = await buildContractCall(method, [userScVal, amountScVal, assetScVal], userAddress);
+  const tx = await buildContractCall(
+    method,
+    [userScVal, amountScVal, assetScVal],
+    userAddress
+  )
 
   // Pre-Transaction Simulation & Validation (Issue #58)
-  const simulation = await simulateTransaction(tx);
+  const simulation = await simulateTransaction(tx)
   if (rpc.Api.isSimulationError(simulation)) {
-    throw new Error(`Transaction simulation failed for ${method}: ${simulation.error}`);
+    throw new Error(
+      `Transaction simulation failed for ${method}: ${simulation.error}`
+    )
   }
   if (!simulation.result) {
-    throw new Error(`Transaction simulation failed for ${method}: No result returned from simulation`);
+    throw new Error(
+      `Transaction simulation failed for ${method}: No result returned from simulation`
+    )
   }
 
-  const prepared = await prepareTransaction(tx);
+  const prepared = await prepareTransaction(tx)
 
-  return prepared.toXDR();
+  return prepared.toXDR()
 }

@@ -333,43 +333,92 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_API_TOKEN" \
 
 ---
 
-## 6. Incident Contacts
+## 6. Database Migration Rollback
+
+Prisma migrations are forward-only — there is no built-in `down`. Every migration
+in `prisma/migrations/<name>/` therefore ships a hand-written `rollback.sql`
+alongside its `migration.sql`. CI enforces this via
+`scripts/check-migration-rollback.sh`.
+
+For a migration that failed mid-apply (`P3009`, `CONCURRENTLY` in a
+transaction, duplicate column, stuck rehearsal), follow
+[MIGRATIONS.md Appendix A: Common failure modes](./MIGRATIONS.md#appendix-a-common-failure-modes).
+
+### When to roll back
+
+Roll back when a freshly deployed migration is itself the problem (broken schema,
+failed constraint, performance regression). If the application code is the
+problem, prefer redeploying the previous app version over a schema rollback.
+
+> **WARNING:** Rollbacks can be destructive — `DROP TABLE`/`DROP COLUMN` discard
+> data. Confirm a recent backup/snapshot exists before proceeding. Some rollbacks
+> are flagged partially irreversible inside their `rollback.sql` (e.g.
+> `20260617000000_fix_agent_log_attribution` cannot restore `NOT NULL` if
+> system-generated rows with a null `userId` exist).
+
+### Procedure
+
+```bash
+# 1. Take / confirm a database snapshot first.
+
+# 2. Identify the migration to reverse (most recent applied is the usual target)
+npx prisma migrate status
+
+# 3. Run the rollback for that migration (applies rollback.sql, then marks it
+#    rolled back in _prisma_migrations and runs a health check).
+DATABASE_URL=$DATABASE_URL bash scripts/rollback-migration.sh <migration-name>
+
+#    Optionally verify the live app afterwards:
+HEALTHCHECK_URL=http://localhost:3001/health/ready \
+  DATABASE_URL=$DATABASE_URL bash scripts/rollback-migration.sh <migration-name>
+
+# 4. Re-deploy the previous application version if the schema change was paired
+#    with code changes.
+```
+
+After a successful rollback the migration is marked `rolled_back_at` in Prisma's
+history, so a later `prisma migrate deploy` (with a fixed migration) re-applies it.
+
+### Authoring rollbacks for new migrations
+
+Every new migration PR must add a `rollback.sql` that reverses its `migration.sql`:
+drop what it created, recreate what it dropped, and document any irreversible
+steps as comments. The `Migration rollback check` workflow blocks merge otherwise.
+
+## 7. Incident Contacts
+
+Alert-by-alert steps, ack timers, and the postmortem workflow are in [INCIDENT_RESPONSE.md](./INCIDENT_RESPONSE.md). This section is the contact list those steps use.
 
 ### Escalation tiers
 
 | Tier | Role | Responsibility | Contact |
 |---|---|---|---|
-| T1 | On-call engineer | Triage, restart, DLQ retry, RPC rotation | PagerDuty / Opsgenie |
-| T2 | Backend lead | Code fix, data reconciliation, migration rollback | Slack @backend-lead |
-| T3 | Engineering manager | Stakeholder comms, post-mortem, priority decisions | Slack @eng-mgr |
-| T4 | Security officer | Key compromise, wallet recovery, audit | Slack @sec-officer |
+| T1 | On-call engineer | Ack, triage, restart, DLQ retry, RPC rotation, sponsor top-up | PagerDuty (`PAGERDUTY_ROUTING_KEY`) |
+| T2 | Backend lead | Code fix, data reconciliation, migration rollback | Slack `@backend-lead`. Page if they have not answered inside the severity window |
+| T3 | Engineering manager | Stakeholder updates, priority, SEV1 postmortem acceptance | Slack `@eng-mgr` |
+| T4 | Security officer | Key compromise, wallet recovery, audit | Slack `@sec-officer`. Page immediately for SEV1 security incidents, do not wait for T2 |
 
 ### Communication channels
 
 | Channel | Purpose |
 |---|---|
 | `#neurowealth-alerts` | Prometheus alert notifications |
-| `#neurowealth-incidents` | Incident coordination thread |
-| PagerDuty | T1 on-call escalation |
-| Email: `ops@neurowealth.io` | Backup contact for critical outages |
+| `#neurowealth-incidents` | Incident coordination thread. The acknowledging engineer is the lead until they hand off in the thread |
+| PagerDuty | T1 page, then T2 at 15 min (SEV1) or 1 hour (SEV2) if still unacked or unmitigated |
+| Email: `ops@neurowealth.io` | Backup when PagerDuty or Slack is unreachable |
 
 ### Incident severity definitions
 
 | Severity | Definition | Response time | Escalation |
 |---|---|---|---|
-| **SEV1** | Event processing halted, funds at risk, data loss | < 15 min | T1 → T2 → T3 |
-| **SEV2** | Lag > 100 ledgers, DLQ > 50, agent loop degraded | < 1 hour | T1 → T2 |
-| **SEV3** | Lag > 50 ledgers, DLQ > 20, elevated error rate | < 8 hours | T1 |
+| **SEV1** | Event processing halted, global agent breaker open, funds at risk, data loss, sponsor XLM exhausted while deposits fail | < 15 min | T1 → T2 at 15 min → T3 at 30 min. T4 immediately for key compromise |
+| **SEV2** | Lag > 100 ledgers, DLQ > 50, agent loop degraded, readiness failing | < 1 hour | T1 → T2 if not mitigated in 1 hour |
+| **SEV3** | Lag > 50 ledgers, DLQ > 20, elevated latency | < 8 hours | T1 |
 | **SEV4** | Minor anomalies, informational alerts | Next business day | None |
 
-### Post-incident checklist
+### After the incident
 
-- [ ] Root cause identified and documented
-- [ ] Fix deployed (or rollback executed)
-- [ ] DLQ resolved and lag cleared
-- [ ] Alert thresholds adjusted if needed
-- [ ] Post-mortem filed in `docs/post-mortems/`
-- [ ] Runbook updated with lessons learned
+SEV1 and SEV2 are not closed until the postmortem in [INCIDENT_RESPONSE.md](./INCIDENT_RESPONSE.md) is merged. That workflow covers the timeline, the root cause, and the action items. Update this runbook in the same follow-up when a step here was wrong or missing.
 
 ---
 
@@ -415,3 +464,214 @@ psql "$DATABASE_URL" -c "
   ORDER BY ledger DESC LIMIT 10;
 "
 ```
+
+## 8. Sponsor Account Top-Up
+
+Sponsored reserves move the XLM cost from user to sponsor accounts (`STELLAR_SPONSOR_KEYS`). Monitor `GET /api/v1/admin/reserves` (admin-scoped, audit-logged) for `outstandingXlm` and `perSponsor[].availableXlm`. Alert `SponsorLowXlm` fires when any sponsor `< 10 XLM` for 5m.
+
+**Top-up:**
+```bash
+# Check
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" http://localhost:3001/api/v1/admin/reserves | jq
+
+# Fund sponsor from treasury/ops hot wallet via Stellar Laboratory or
+stellar account fund --destination <sponsorPublicKey> --amount 100 --network public
+
+# Verify
+curl -s http://localhost:3001/metrics | grep sponsor_available_xlm
+psql "$DATABASE_URL" -c "SELECT \"sponsorAccount\", count(*), sum(\"xlmReserved\") FROM reserve_sponsorships WHERE status='ACTIVE' GROUP BY \"sponsorAccount\";"
+```
+
+No auto top-up — operational runbook only. Reconciliation job (`reserveReconciliation` hourly) flags drift where on-chain sponsor ≠ ledger.
+
+## 9. Agent Circuit Breaker (#345)
+
+The agent circuit breaker halts agent-initiated rebalancing when the market,
+a protocol, or a user's account shows risk. It never touches withdrawals.
+Scopes: `GLOBAL` (halt everything), `PROTOCOL` (halt a target protocol +
+batches leaving it), `USER` (halt that user's batches). Breakers are
+`CLOSED → OPEN → HALF_OPEN → CLOSED`; an `OPEN` breaker auto-probes after its
+cooldown and needs `BREAKER_DEPEG_SUSTAINED_CHECKS` clean evaluations before
+recovering to `HALF_OPEN`, then one clean probe to close.
+
+### Rules
+
+| Rule | Env | Default | Trips when |
+|---|---|---|---|
+| abnormal_loss | `BREAKER_LOSS_PCT`, `BREAKER_LOSS_WINDOW_HOURS` | 5% / 24h | mark-to-market drawdown over the window exceeds the pct |
+| depeg | `BREAKER_DEPEG_ENABLED` (=`false`) | off | reported stablecoin price deviates > `BREAKER_DEPEG_BPS` (150) from $1 |
+| oscillation | `BREAKER_MAX_FLIPS`, `BREAKER_FLIP_WINDOW_HOURS` | 3 / 24h | same batch rebalances ≥ N times in the window |
+| stale_data | `BREAKER_STALE_MINUTES`, `BREAKER_STALE_CONSECUTIVE_FAILURES` | 120m / 3 | APY table older than limit, never scanned, or ≥ N consecutive failures |
+
+`BREAKER_COOLDOWN_MS` (1h) is the base cooldown; a repeated HALF_OPEN trip
+doubles it up to `BREAKER_MAX_COOLDOWN_MS` (24h).
+
+### Known limitation — de-peg price feed
+
+The de-peg rule is a pure consumer of a stablecoin spot price. As of this
+change no live price feed exists in this codebase: the fee oracle
+(`src/stellar/feeOracle.ts`) publishes only fees, and `src/stellar/routing.ts`
+is a stub. `getStablecoinPrice()` (`src/agent/breakerService.ts`) is the single
+integration point and currently returns `null` (fails safe — the rule never
+trips); the rule is disabled by default. Wire the oracle there, keep the pure
+rule unchanged, flip `BREAKER_DEPEG_ENABLED=true`, and re-run the de-peg unit
+tests.
+
+### Inspector
+
+```bash
+# All breakers with current state
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" http://localhost:3001/api/v1/admin/agent/breakers | jq
+
+# Agent status (incl. cached global breaker summary)
+curl -H "X-Internal-Token: $INTERNAL_SERVICE_TOKEN" http://localhost:3001/api/v1/agent/status | jq
+```
+
+### Manual trip
+
+`POST /api/v1/admin/agent/breakers` — body `{"scope":"PROTOCOL","scopeKey":"blend","reason":"..."}`.
+`GLOBAL` needs no `scopeKey`; `USER`/`PROTOCOL` require it. `reason` is always
+required. Written to the admin audit log (`TRIP_AGENT_BREAKER`).
+
+```bash
+curl -X POST http://localhost:3001/api/v1/admin/agent/breakers \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"scope":"PROTOCOL","scopeKey":"blend","reason":"incident-4821 protocol outage"}'
+```
+
+A manual trip can only be cleared manually (`rule=manual` breakers never
+auto-reset). Manual resets are audit-logged too:
+
+```bash
+curl -X POST http://localhost:3001/api/v1/admin/agent/breakers/<id>/reset \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"reason":"incident-4821 resolved, APY table verified fresh"}'
+```
+
+A breaker skips its tick when evaluation itself fails: the agent alerts
+(critical, `agent-breaker:eval-failed`) and halts **all** rebalancing for that
+tick rather than trading blind.
+
+### Response
+
+1. **Global halt**: investigate the trip rule (`agent_breaker_trips_total{scope="GLOBAL"}`), check the `[Breaker]` logs for the `lastEvaluation` detail, fix root cause, then either wait for auto-recovery or reset manually.
+2. **Protocol halt**: verify the protocol's APY/status independently before resetting; `compareProtocols` already refuses it as a target while OPEN.
+3. **User halt**: confirm with the user before resetting.
+4. **Evaluation-failed halt**: the breaker could not decide — check DB connectivity and the logged error before the next tick.
+
+### Verify
+
+```bash
+curl -s http://localhost:3001/metrics | grep -E "agent_breaker_(state|trips_total)"
+psql "$DATABASE_URL" -c "SELECT scope, \"scopeKey\", state, \"trippedRule\" FROM agent_circuit_breakers ORDER BY \"updatedAt\" DESC;"
+```
+
+---
+
+## 10. Feature Flags & Emergency Rollback Runbook (#494)
+
+Detailed reference and architectural specifications are documented in [docs/FEATURE_FLAGS.md](FEATURE_FLAGS.md).
+
+### Inspect Active Feature Flags
+
+```bash
+# List all feature flags and runtime evaluation for the current environment
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+  http://localhost:3001/api/v1/admin/feature-flags | jq
+
+# Inspect single flag
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+  http://localhost:3001/api/v1/admin/feature-flags/smart_dca_engine | jq
+```
+
+### Staged Rollout Adjustment
+
+```bash
+# Advance rollout percentage (0 to 100)
+curl -X POST http://localhost:3001/api/v1/admin/feature-flags/smart_dca_engine/staged-rollout \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"percentage": 25}'
+```
+
+### Fast Emergency Rollback (< 1s)
+
+When an anomaly or regression is detected, trigger an immediate rollback. This clamps the rollout to 0%, engages the rollback lock, increments the Prometheus rollback metric, logs structured SRE audit events, and broadcasts the event across Redis:
+
+```bash
+# Fast rollback with mandatory reason
+curl -X POST http://localhost:3001/api/v1/admin/feature-flags/smart_dca_engine/rollback \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "High slippage observed in Horizon liquidity pools"}'
+```
+
+### Platform-Wide Emergency Maintenance Mode
+
+To halt all state-mutating requests platform-wide during an active exploit or catastrophic dependency failure:
+
+```bash
+curl -X POST http://localhost:3001/api/v1/admin/feature-flags/emergency-disable-all \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Halting mutating requests due to protocol exploit"}'
+```
+
+### Environment Variable Emergency Disable
+
+If the admin endpoint is unreachable, override in the environment without deploying new code:
+
+```bash
+# Disable specific flags via rollback
+FEATURE_FLAGS_ROLLBACK=smart_dca_engine,fast_fiat_onramp
+
+# Or engage individual kill switch
+FEATURE_FLAG_SMART_DCA_ENGINE_KILL_SWITCH=true
+```
+
+### Reset to Default Environment Configuration
+
+```bash
+curl -X POST http://localhost:3001/api/v1/admin/feature-flags/smart_dca_engine/reset \
+  -H "Authorization: Bearer $ADMIN_API_TOKEN"
+```
+
+---
+
+## 13. Telegram & WhatsApp Message Delivery Recovery (#493)
+
+### Alert: `telegram_dlq_high` / `whatsapp_dlq_high`
+Triggered when dead-lettered message count exceeds `MESSAGING_DLQ_ALERT_THRESHOLD` (default: 10).
+
+### Diagnostic commands
+```bash
+# Check queue metrics and dead-letter count
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" http://localhost:3001/api/v1/admin/messages/stats | jq
+
+# List failed / dead-lettered messages
+curl -H "Authorization: Bearer $ADMIN_API_TOKEN" "http://localhost:3001/api/v1/admin/messages?status=DEAD_LETTER&limit=20" | jq
+```
+
+### Recovery actions
+1. **Investigate Root Cause**: Inspect `lastError` on failed deliveries:
+   - 429 Rate Limits: Verify rate-limit configuration and exponential backoff settings.
+   - 403 Forbidden (Telegram): User blocked the bot; cancel message or re-route.
+   - 21211 (WhatsApp/Twilio): Invalid phone number format.
+2. **Bulk Retry Dead Letters**: Once downstream connectivity is restored:
+   ```bash
+   curl -X POST http://localhost:3001/api/v1/admin/messages/retry-dead-letters \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"channel": "TELEGRAM"}'
+   ```
+3. **Single Message Manual Retry**:
+   ```bash
+   curl -X POST http://localhost:3001/api/v1/admin/messages/<message-id>/retry \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN"
+   ```
+4. **Cancel Poison Messages**:
+   ```bash
+   curl -X DELETE http://localhost:3001/api/v1/admin/messages/<message-id> \
+     -H "Authorization: Bearer $ADMIN_API_TOKEN"
+   ```
+

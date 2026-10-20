@@ -1,6 +1,7 @@
 import winston from 'winston'
 import * as fs from 'fs'
 import * as path from 'path'
+import { trace } from '@opentelemetry/api'
 import { getCorrelationId } from './correlation'
 
 // Ensure logs directory exists with fail-safe handling
@@ -11,7 +12,10 @@ try {
   }
 } catch (error) {
   // If we can't create logs directory, fall back to console-only logging
-  console.error('[Logger] Failed to create logs directory, using console-only:', error)
+  console.error(
+    '[Logger] Failed to create logs directory, using console-only:',
+    error
+  )
 }
 
 // Sensitive data patterns to redact
@@ -39,28 +43,40 @@ function redactSensitiveData(message: string): string {
   return redacted
 }
 
-// Inject correlation ID from AsyncLocalStorage when present
+// Inject correlation ID from AsyncLocalStorage and the active trace context
+// when present, so log lines can be joined to both requests and traces.
 const correlationFormat = winston.format((info) => {
   const correlationId = getCorrelationId()
   if (correlationId && !info.correlationId) {
     info.correlationId = correlationId
   }
+  const spanContext = trace.getActiveSpan()?.spanContext()
+  if (spanContext && !info.traceId) {
+    info.traceId = spanContext.traceId
+    info.spanId = spanContext.spanId
+  }
   return info
 })
 
 // Custom format that redacts sensitive data
-const redactFormat = winston.format.printf(({ timestamp, level, message, ...meta }) => {
-  const safeMessage = typeof message === 'string' ? redactSensitiveData(message) : message
-  const safeMeta: any = {}
-  for (const [key, value] of Object.entries(meta)) {
-    safeMeta[key] = typeof value === 'string' ? redactSensitiveData(value) : value
+const redactFormat = winston.format.printf(
+  ({ timestamp, level, message, ...meta }) => {
+    const safeMessage =
+      typeof message === 'string' ? redactSensitiveData(message) : message
+    const safeMeta: any = {}
+    for (const [key, value] of Object.entries(meta)) {
+      safeMeta[key] =
+        typeof value === 'string' ? redactSensitiveData(value) : value
+    }
+    const metaStr = Object.keys(safeMeta).length ? JSON.stringify(safeMeta) : ''
+    return `${timestamp} [${level}]: ${safeMessage} ${metaStr}`
   }
-  const metaStr = Object.keys(safeMeta).length ? JSON.stringify(safeMeta) : ''
-  return `${timestamp} [${level}]: ${safeMessage} ${metaStr}`
-})
+)
 
 // Determine log level from environment
-const logLevel = process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug')
+const logLevel =
+  process.env.LOG_LEVEL ||
+  (process.env.NODE_ENV === 'production' ? 'info' : 'debug')
 const isProduction = process.env.NODE_ENV === 'production'
 
 // Create base transports array
@@ -85,7 +101,10 @@ if (fs.existsSync(logsDir) && fs.statSync(logsDir).isDirectory()) {
         maxsize: 10 * 1024 * 1024, // 10MB
         maxFiles: 5,
         format: isProduction
-          ? winston.format.combine(winston.format.timestamp(), winston.format.json())
+          ? winston.format.combine(
+              winston.format.timestamp(),
+              winston.format.json()
+            )
           : winston.format.combine(winston.format.timestamp(), redactFormat),
       })
     )
@@ -97,7 +116,10 @@ if (fs.existsSync(logsDir) && fs.statSync(logsDir).isDirectory()) {
         maxsize: 10 * 1024 * 1024, // 10MB
         maxFiles: 5,
         format: isProduction
-          ? winston.format.combine(winston.format.timestamp(), winston.format.json())
+          ? winston.format.combine(
+              winston.format.timestamp(),
+              winston.format.json()
+            )
           : winston.format.combine(winston.format.timestamp(), redactFormat),
       })
     )
@@ -141,7 +163,7 @@ export { redactSensitiveData, SENSITIVE_PATTERNS }
  */
 export function logBackgroundJob(
   jobName: string,
-  status: 'success' | 'failed',
+  status: 'success' | 'failed' | 'dry_run',
   durationSeconds: number,
   correlationId?: string,
   details?: Record<string, any>

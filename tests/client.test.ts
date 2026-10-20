@@ -38,12 +38,14 @@ jest.mock('../src/config', () => ({
 // mock an open signature so every call to those helpers type-checks correctly.
 const mockSendTransaction = jest.fn<(...args: any[]) => any>()
 const mockGetAccount = jest.fn<(...args: any[]) => any>()
+const mockGetTransaction = jest.fn<(...args: any[]) => any>()
 
 jest.mock('@stellar/stellar-sdk', () => ({
   rpc: {
     Server: jest.fn().mockImplementation(() => ({
       sendTransaction: mockSendTransaction,
       getAccount: mockGetAccount,
+      getTransaction: mockGetTransaction,
     })),
   },
   Networks: { TESTNET: 'Test SDF Network ; September 2015' },
@@ -116,30 +118,37 @@ describe('ResilientRpcClient', () => {
 
   describe('circuit breaker open', () => {
     it('skips an endpoint whose circuit breaker is open and falls over', async () => {
-      // threshold = 2, so two failures open the breaker
+      // threshold = 2 and maxRetries = 1, so the first call's two primary
+      // attempts fail, open the primary circuit, and the call fails over to
+      // the secondary in-flight.
       mockGetAccount
         .mockRejectedValueOnce(new Error('fail 1'))
         .mockRejectedValueOnce(new Error('fail 2'))
-        // After circuit opens, second endpoint should be tried
         .mockResolvedValueOnce({ id: 'GABC', sequence: '3' })
+        .mockResolvedValueOnce({ id: 'GABC', sequence: '4' })
 
       setEnvUrls('https://primary.example.com,https://secondary.example.com')
       jest.resetModules()
       const { getAccount } = await import('../src/stellar/client')
 
-      // First two calls exhaust retries and open the primary circuit
-      await expect(getAccount('GABC')).rejects.toThrow()
-      await expect(getAccount('GABC')).rejects.toThrow()
+      // First call: primary fails twice (circuit opens), secondary succeeds.
+      const first = await getAccount('GABC')
+      expect(first).toEqual({ id: 'GABC', sequence: '3' })
+      expect(mockGetAccount).toHaveBeenCalledTimes(3)
 
-      // Third call: primary circuit is open → skipped → secondary succeeds
-      const result = await getAccount('GABC')
-      expect(result).toEqual({ id: 'GABC', sequence: '3' })
+      // Second call: primary circuit is open → skipped → only secondary is hit.
+      const second = await getAccount('GABC')
+      expect(second).toEqual({ id: 'GABC', sequence: '4' })
+      expect(mockGetAccount).toHaveBeenCalledTimes(4)
     })
   })
 
   describe('submitTransaction', () => {
     it('returns hash on PENDING status', async () => {
-      mockSendTransaction.mockResolvedValueOnce({ status: 'PENDING', hash: 'abc123' })
+      mockSendTransaction.mockResolvedValueOnce({
+        status: 'PENDING',
+        hash: 'abc123',
+      })
 
       setEnvUrls('https://primary.example.com')
       jest.resetModules()
@@ -150,7 +159,9 @@ describe('ResilientRpcClient', () => {
     })
 
     it('throws on ERROR status', async () => {
-      mockSendTransaction.mockResolvedValueOnce({
+      // Persistent (not once): the adapter retries after the thrown error, so
+      // every attempt must see the same ERROR response.
+      mockSendTransaction.mockResolvedValue({
         status: 'ERROR',
         errorResult: { toXDR: () => 'base64err' },
       })
@@ -159,7 +170,68 @@ describe('ResilientRpcClient', () => {
       jest.resetModules()
       const { submitTransaction } = await import('../src/stellar/client')
 
-      await expect(submitTransaction({} as any)).rejects.toThrow('Transaction failed')
+      await expect(submitTransaction({} as any)).rejects.toThrow(
+        'Transaction failed'
+      )
+    })
+  })
+
+  describe('waitForConfirmation', () => {
+    it('returns a confirmed hash and ledger', async () => {
+      mockGetTransaction.mockResolvedValueOnce({
+        status: 'SUCCESS',
+        ledger: 123,
+      })
+
+      setEnvUrls('https://primary.example.com')
+      jest.resetModules()
+      const { waitForConfirmation } = await import('../src/stellar/client')
+
+      await expect(waitForConfirmation('tx-confirmed', 100)).resolves.toEqual({
+        hash: 'tx-confirmed',
+        status: 'success',
+        ledger: 123,
+      })
+    })
+
+    it('returns a definitive on-chain failure', async () => {
+      mockGetTransaction.mockResolvedValueOnce({ status: 'FAILED' })
+
+      setEnvUrls('https://primary.example.com')
+      jest.resetModules()
+      const { waitForConfirmation } = await import('../src/stellar/client')
+
+      await expect(waitForConfirmation('tx-failed', 100)).resolves.toEqual({
+        hash: 'tx-failed',
+        status: 'failed',
+      })
+    })
+
+    it('throws a hash-bearing timeout for an unconfirmed transaction', async () => {
+      mockGetTransaction.mockResolvedValue({ status: 'NOT_FOUND' })
+
+      setEnvUrls('https://primary.example.com')
+      jest.resetModules()
+      const { waitForConfirmation } = await import('../src/stellar/client')
+
+      await expect(waitForConfirmation('tx-pending', 0)).rejects.toMatchObject({
+        name: 'TransactionConfirmationTimeoutError',
+        txHash: 'tx-pending',
+      })
+    })
+  })
+
+  describe('getTransactionStatus', () => {
+    it('distinguishes NOT_FOUND from a failed transaction', async () => {
+      mockGetTransaction.mockResolvedValueOnce({ status: 'NOT_FOUND' })
+
+      setEnvUrls('https://primary.example.com')
+      jest.resetModules()
+      const { getTransactionStatus } = await import('../src/stellar/client')
+
+      await expect(getTransactionStatus('tx-unknown')).resolves.toBe(
+        'not_found'
+      )
     })
   })
 
@@ -171,8 +243,14 @@ describe('ResilientRpcClient', () => {
 
       const snap = getRpcHealthSnapshot()
       expect(snap).toHaveLength(2)
-      expect(snap[0]).toMatchObject({ url: 'https://primary.example.com', state: 'closed' })
-      expect(snap[1]).toMatchObject({ url: 'https://secondary.example.com', state: 'closed' })
+      expect(snap[0]).toMatchObject({
+        url: 'https://primary.example.com',
+        state: 'closed',
+      })
+      expect(snap[1]).toMatchObject({
+        url: 'https://secondary.example.com',
+        state: 'closed',
+      })
     })
   })
 
@@ -180,11 +258,14 @@ describe('ResilientRpcClient', () => {
     it('resets all endpoints to closed state', async () => {
       setEnvUrls('https://primary.example.com')
       jest.resetModules()
-      const { resetRpcCircuitBreakers, getRpcHealthSnapshot } = await import('../src/stellar/client')
+      const { resetRpcCircuitBreakers, getRpcHealthSnapshot } =
+        await import('../src/stellar/client')
 
       resetRpcCircuitBreakers()
       const snap = getRpcHealthSnapshot()
-      expect(snap.every((e: { state: string }) => e.state === 'closed')).toBe(true)
+      expect(snap.every((e: { state: string }) => e.state === 'closed')).toBe(
+        true
+      )
     })
   })
 })
