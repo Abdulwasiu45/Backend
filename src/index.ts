@@ -77,6 +77,10 @@ import { scheduleLinkedExternalWalletSync } from './jobs/linkedExternalWalletSyn
 import { startEventListener, stopEventListener } from './stellar/events'
 import { startEventBridge, stopEventBridge } from './events/bridge'
 import { attachWebSocketServer, closeWebSocketServer } from './ws/server'
+import {
+  startCacheInvalidationSubscriber,
+  stopCacheInvalidationSubscriber,
+} from './utils/user-cache-invalidation'
 import { validateStellarNetworkReady } from './config/readiness'
 import { API_ROUTES, EXTRA_MOUNTS } from './routes/registry'
 import {
@@ -498,6 +502,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   logger.info('[Shutdown] Draining WebSocket connections...')
   await closeWebSocketServer()
   await stopEventBridge()
+  await stopCacheInvalidationSubscriber()
 
   logger.info('[Shutdown] Closing HTTP server (no new requests accepted)')
   httpServer.close(async () => {
@@ -565,6 +570,23 @@ async function initServices(): Promise<void> {
   }
   logger.info('[Startup] Twilio auth token configured ✓')
 
+  // 0. Validate WebAuthn configuration in production
+  if (config.nodeEnv === 'production' || config.nodeEnv === 'staging') {
+    const { webAuthnConfig } = await import('./services/webauthn.service')
+    try {
+      webAuthnConfig()
+      logger.info('[Startup] WebAuthn configuration validated ✓')
+    } catch (error) {
+      const msg =
+        error instanceof Error ? error.message : String(error)
+      logger.error(
+        '[Startup] WebAuthn configuration validation failed — cannot continue',
+        { error: msg }
+      )
+      throw new Error(`WebAuthn: ${msg}`)
+    }
+  }
+
   // 0. Validate Stellar network configuration
   validateStellarNetworkReady()
 
@@ -630,6 +652,19 @@ async function initServices(): Promise<void> {
   } catch (error) {
     logger.warn(
       '[Startup] Feature flag Redis sync failed — continuing with local configuration',
+      {
+        error: error instanceof Error ? error.message : String(error),
+      }
+    )
+  }
+
+  // 6. Cache invalidation subscriber (#611) — best-effort, never blocks startup
+  try {
+    startCacheInvalidationSubscriber()
+    logger.info('[Startup] Cache invalidation subscriber initialized ✓')
+  } catch (error) {
+    logger.warn(
+      '[Startup] Cache invalidation subscriber failed — continuing with pod-local invalidation only',
       {
         error: error instanceof Error ? error.message : String(error),
       }
