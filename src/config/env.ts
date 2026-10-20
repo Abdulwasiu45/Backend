@@ -529,10 +529,20 @@ export const config = {
   },
   messaging: {
     maxRetries: parseInt(process.env.MESSAGING_MAX_RETRIES || '3'),
-    baseDelayMs: parseInt(process.env.MESSAGING_BASE_DELAY_MS || '1000'),
-    maxDelayMs: parseInt(process.env.MESSAGING_MAX_DELAY_MS || '30000'),
+    baseDelayMs: parseInt(
+      process.env.MESSAGING_BASE_DELAY_MS ||
+        process.env.MESSAGING_RETRY_BASE_DELAY_MS ||
+        '1000'
+    ),
+    maxDelayMs: parseInt(
+      process.env.MESSAGING_MAX_DELAY_MS ||
+        process.env.MESSAGING_RETRY_MAX_DELAY_MS ||
+        '30000'
+    ),
     retryIntervalMs: parseInt(
-      process.env.MESSAGING_RETRY_INTERVAL_MS || '60000'
+      process.env.MESSAGING_RETRY_INTERVAL_MS ||
+        process.env.MESSAGING_SWEEP_INTERVAL_MS ||
+        '60000'
     ),
     fallbackEnabled: process.env.MESSAGING_FALLBACK_ENABLED !== 'false',
     dlqAlertThreshold: parseInt(

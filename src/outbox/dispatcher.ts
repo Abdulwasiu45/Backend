@@ -35,6 +35,7 @@ import { sortForDispatch } from './stateMachine'
 import { OutboxOpRecord } from './types'
 import {
   claimOp,
+  clearStaleSubmittedTxHash,
   findClaimableOps,
   findStuckSubmittedOps,
   getOp,
@@ -400,6 +401,25 @@ async function reconcileStuckSubmitted(): Promise<void> {
         recordOutboxOp(op.kind, op.priority, 'failed')
         await onTerminalFailure(op, 'Submitted Stellar transaction failed')
         continue
+      }
+
+      if (chainStatus === 'not_found') {
+        // The network no longer knows this hash (expired from the RPC
+        // window or never propagated). Fee-bumping the same envelope
+        // cannot confirm it, so clear the stale hash and send the op
+        // back through the retry pipeline for a fresh submission —
+        // subject to the same fee-bump cap as any other retry.
+        logger.warn(
+          '[Outbox] Submitted hash unknown to network — clearing for resubmission',
+          {
+            opId: op.id,
+            kind: op.kind,
+            txHash: op.txHash,
+            attempts: op.attempts,
+          }
+        )
+        await clearStaleSubmittedTxHash(op.id)
+        op.txHash = null
       }
     }
 
