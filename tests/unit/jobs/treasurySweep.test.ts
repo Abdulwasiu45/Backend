@@ -6,7 +6,7 @@ import {
   validateHysteresis,
 } from '../../../src/jobs/treasurySweep'
 import db from '../../../src/db'
-import { getAccount } from '../../../src/stellar/client'
+import { getNativeBalance } from '../../../src/stellar/client'
 import { enqueueOutboxOp } from '../../../src/outbox/service'
 import { alertingService } from '../../../src/services/alerting'
 
@@ -21,7 +21,7 @@ jest.mock('../../../src/db', () => ({
   },
 }))
 jest.mock('../../../src/stellar/client', () => ({
-  getAccount: jest.fn(),
+  getNativeBalance: jest.fn(),
 }))
 jest.mock('../../../src/outbox/service', () => ({
   enqueueOutboxOp: jest.fn(),
@@ -34,7 +34,7 @@ jest.mock('../../../src/utils/logger', () => ({
 }))
 
 const mockDb = db as any
-const mockGetAccount = getAccount as jest.Mock
+const mockGetNativeBalance = getNativeBalance as jest.Mock
 const mockEnqueue = enqueueOutboxOp as jest.Mock
 
 beforeEach(() => {
@@ -75,9 +75,7 @@ describe('evaluateTreasuryBalances', () => {
       }
       return Promise.resolve([])
     })
-    mockGetAccount.mockResolvedValue({
-      balances: [{ asset_type: 'native', balance: '8000' }],
-    })
+    mockGetNativeBalance.mockResolvedValue(8000)
 
     const plans = await evaluateTreasuryBalances()
 
@@ -136,33 +134,31 @@ describe('executeSweep', () => {
     )
   })
 
-  it('opens a MultisigEnvelope instead of enqueueing when amount exceeds requiresApprovalAbove', async () => {
+  it('refuses a sweep above requiresApprovalAbove with an operator-visible error (#655)', async () => {
     mockDb.treasurySweepPolicy.findFirst.mockResolvedValue({
       fromTier: 'HOT',
       toTier: 'WARM',
       requiresApprovalAbove: '500',
       sweepsEnabled: true,
     })
-    mockDb.treasurySweep.create.mockResolvedValue({ id: 'sweep-2' })
-    mockDb.multisigEnvelope.create.mockResolvedValue({ id: 'env-1' })
 
-    await executeSweep({
-      fromTier: 'HOT',
-      toTier: 'WARM',
-      asset: 'XLM',
-      amount: '1000',
-      reason: 'hot_over_high_band',
-    })
-
-    expect(mockDb.multisigEnvelope.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          sweepId: 'sweep-2',
-          status: 'PENDING',
-        }),
+    await expect(
+      executeSweep({
+        fromTier: 'HOT',
+        toTier: 'WARM',
+        asset: 'XLM',
+        amount: '1000',
+        reason: 'hot_over_high_band',
       })
-    )
+    ).rejects.toThrow(/exceeds requiresApprovalAbove/)
+
+    expect(mockDb.treasurySweep.create).not.toHaveBeenCalled()
+    expect(mockDb.multisigEnvelope.create).not.toHaveBeenCalled()
     expect(mockEnqueue).not.toHaveBeenCalled()
+    expect(alertingService.emit).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical' }),
+      expect.stringContaining('treasury-sweep-failed')
+    )
   })
 })
 
@@ -228,9 +224,7 @@ describe('previewTreasurySweep (#620)', () => {
       Promise.resolve(where.fromTier === 'HOT' ? policy : null)
     )
     mockDb.treasuryAccount.findMany.mockResolvedValue([{ publicKey: 'GHOT' }])
-    mockGetAccount.mockResolvedValue({
-      balances: [{ asset_type: 'native', balance: '6000' }],
-    })
+    mockGetNativeBalance.mockResolvedValue(6000)
   })
 
   it('reports plans for a disabled policy without writing anything', async () => {
