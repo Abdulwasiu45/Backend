@@ -6,7 +6,7 @@ import {
   validateHysteresis,
 } from '../../../src/jobs/treasurySweep'
 import db from '../../../src/db'
-import { getAccount } from '../../../src/stellar/client'
+import { getNativeBalance } from '../../../src/stellar/client'
 import { enqueueOutboxOp } from '../../../src/outbox/service'
 import { alertingService } from '../../../src/services/alerting'
 
@@ -21,7 +21,7 @@ jest.mock('../../../src/db', () => ({
   },
 }))
 jest.mock('../../../src/stellar/client', () => ({
-  getAccount: jest.fn(),
+  getNativeBalance: jest.fn(),
 }))
 jest.mock('../../../src/outbox/service', () => ({
   enqueueOutboxOp: jest.fn(),
@@ -34,7 +34,7 @@ jest.mock('../../../src/utils/logger', () => ({
 }))
 
 const mockDb = db as any
-const mockGetAccount = getAccount as jest.Mock
+const mockGetNativeBalance = getNativeBalance as jest.Mock
 const mockEnqueue = enqueueOutboxOp as jest.Mock
 
 beforeEach(() => {
@@ -75,9 +75,7 @@ describe('evaluateTreasuryBalances', () => {
       }
       return Promise.resolve([])
     })
-    mockGetAccount.mockResolvedValue({
-      balances: [{ asset_type: 'native', balance: '8000' }],
-    })
+    mockGetNativeBalance.mockResolvedValue(8000)
 
     const plans = await evaluateTreasuryBalances()
 
@@ -228,9 +226,7 @@ describe('previewTreasurySweep (#620)', () => {
       Promise.resolve(where.fromTier === 'HOT' ? policy : null)
     )
     mockDb.treasuryAccount.findMany.mockResolvedValue([{ publicKey: 'GHOT' }])
-    mockGetAccount.mockResolvedValue({
-      balances: [{ asset_type: 'native', balance: '6000' }],
-    })
+    mockGetNativeBalance.mockResolvedValue(6000)
   })
 
   it('reports plans for a disabled policy without writing anything', async () => {

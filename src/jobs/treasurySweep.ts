@@ -17,7 +17,7 @@ import db from '../db'
 import { logger } from '../utils/logger'
 import { getActivePolicy } from '../treasury/policy'
 import { enqueueOutboxOp } from '../outbox/service'
-import { getAccount } from '../stellar/client'
+import { getNativeBalance } from '../stellar/client'
 import { alertingService } from '../services/alerting'
 
 const TREASURY_SWEEP_INTERVAL_MS = 300_000 // 5 minutes
@@ -35,13 +35,6 @@ const TIER_PAIRS: Array<[TreasuryTier, TreasuryTier]> = [
   ['HOT', 'WARM'],
   ['WARM', 'COLD'],
 ]
-
-async function getNativeBalance(publicKey: string): Promise<number> {
-  const account: any = await getAccount(publicKey).catch(() => null)
-  if (!account?.balances) return 0
-  const native = account.balances.find((b: any) => b.asset_type === 'native')
-  return native ? parseFloat(native.balance) : 0
-}
 
 export interface SweepPreviewItem extends SweepPlan {
   policyId: string
@@ -65,7 +58,7 @@ async function planSweeps(
     })
 
     for (const account of accounts) {
-      const balance = await getNativeBalance(account.publicKey)
+      const balance = await getNativeBalance(account.publicKey).catch(() => 0)
       const over = balance - Number(policy.maxHotBalance)
       if (over <= Number(policy.minSweepAmount)) continue
 
