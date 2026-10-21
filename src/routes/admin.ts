@@ -40,16 +40,40 @@ import { messageDeliveryService } from '../messaging'
 const router = Router()
 const prisma = db
 
-function auditLog(
+const HIGH_RISK_ADMIN_ACTIONS = new Set([
+  'EXECUTE_ERASURE',
+  'CREATE_ERASURE_REQUEST',
+  'APPROVE_ERASURE_REQUEST',
+  'REJECT_ERASURE_REQUEST',
+  'REVOKE_ALL_USER_SESSIONS',
+  'REVOKE_USER_SESSION',
+  'REVOKE_ADMIN_KEY',
+  'ROTATE_ADMIN_KEY',
+  'CREATE_ADMIN_KEY',
+  'EMERGENCY_DISABLE_ALL_FEATURE_FLAGS',
+  'TREASURY_SIGNER_ROTATION_INITIATE',
+  'TREASURY_SIGNER_ROTATION_FINALIZE',
+  'TREASURY_POLICY_ENABLE',
+  'FIAT_PROVIDER_FAILOVER',
+  'DLQ_RESOLVE',
+  'DLQ_REPLAY',
+  'OUTBOX_CANCEL',
+  'OUTBOX_FORCE_RETRY',
+])
+
+async function auditLog(
   req: Request,
   res: Response,
   action: string,
   result: string,
   details?: Record<string, any>
-): void {
+): Promise<void> {
   const adminAuth = getAdminAuth(res)
   if (!adminAuth) {
-    logger.error('[Admin Audit] Missing valid admin identity', { action })
+    logger.error(
+      '[Admin Audit] Missing valid admin identity [SECURITY ALERT]',
+      { action }
+    )
     return
   }
   const auditPayload = {
@@ -68,8 +92,9 @@ function auditLog(
   logger.info('[Admin Audit]', auditPayload)
 
   if (adminAuth) {
-    prisma.adminAuditLog
-      .create({
+    const isHighRisk = HIGH_RISK_ADMIN_ACTIONS.has(action)
+    try {
+      const createPromise = prisma.adminAuditLog.create({
         data: {
           adminKeyId: adminAuth.id,
           adminName: adminAuth.name,
@@ -84,12 +109,30 @@ function auditLog(
           path: req.originalUrl || req.path,
         },
       })
-      .catch((error: unknown) => {
-        logger.error('[Admin Audit] Failed to persist audit entry', {
+
+      if (isHighRisk) {
+        // High-risk mutations MUST await persistence to ensure an unbroken audit trail (#690)
+        await createPromise
+      } else {
+        createPromise.catch((error: unknown) => {
+          logger.error('[Admin Audit] Failed to persist audit entry [ALERT]', {
+            error: error instanceof Error ? error.message : String(error),
+            action,
+            alert: true,
+          })
+        })
+      }
+    } catch (error: unknown) {
+      logger.error(
+        '[Admin Audit] CRITICAL: Failed to persist high-risk audit entry [SECURITY ALERT]',
+        {
           error: error instanceof Error ? error.message : String(error),
           action,
-        })
-      })
+          alert: true,
+        }
+      )
+      throw error // Fail closed for high-risk operations
+    }
   }
 }
 
