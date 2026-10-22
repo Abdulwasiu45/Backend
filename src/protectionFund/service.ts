@@ -294,13 +294,18 @@ function computePositionLoss(
 export async function executePayout(claimId: string) {
   const claim = await db.coverageClaim.findUnique({
     where: { id: claimId },
-    include: { event: true, user: { select: { walletAddress: true } } },
+    include: { event: true },
   })
   if (!claim) throw new Error('Claim not found')
   if (claim.status !== 'PENDING')
     throw new Error(`Claim is not pending (status: ${claim.status})`)
   if (claim.payoutAmount.lte(0)) throw new Error('Claim has zero payout')
-  if (!claim.user.walletAddress)
+
+  const user = await db.user.findUnique({
+    where: { id: claim.userId },
+    select: { walletAddress: true },
+  })
+  if (!user?.walletAddress)
     throw new Error(`User ${claim.userId} has no wallet address`)
 
   const outboxOp = await enqueueOutboxOp(db, {
@@ -311,7 +316,7 @@ export async function executePayout(claimId: string) {
     payload: {
       method: 'protection_fund_payout',
       userId: claim.userId,
-      userAddress: claim.user.walletAddress,
+      userAddress: user.walletAddress,
       amount: Number(claim.payoutAmount),
       assetSymbol: 'USDC',
       claimId,
@@ -358,7 +363,12 @@ export async function getMyCoverage(userId: string) {
   const exposure = []
 
   for (const pos of positions) {
-    const holdDuration = Date.now() - pos.openedAt.getTime()
+    const openedTime = pos.openedAt
+      ? pos.openedAt.getTime()
+      : (pos as any).createdAt
+        ? new Date((pos as any).createdAt).getTime()
+        : Date.now()
+    const holdDuration = Date.now() - openedTime
     const eligible = holdDuration >= terms.minHoldDurationMs
 
     exposure.push({
