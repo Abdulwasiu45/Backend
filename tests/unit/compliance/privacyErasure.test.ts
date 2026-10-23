@@ -39,6 +39,7 @@ jest.mock('../../../src/services/alerting', () => ({
 }))
 
 const mockDb = db as any
+let transactionErasureUpdate: jest.Mock
 
 beforeEach(() => {
   jest.clearAllMocks()
@@ -53,6 +54,7 @@ beforeEach(() => {
     findFirst: jest.fn(),
     findMany: jest.fn(),
     update: jest.fn(),
+    updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     count: jest.fn(),
   }
   mockDb.session = { count: jest.fn() }
@@ -71,6 +73,7 @@ beforeEach(() => {
   mockDb.lotDisposal = { count: jest.fn(), updateMany: jest.fn() }
   mockDb.portfolioAttribution = { count: jest.fn(), updateMany: jest.fn() }
   mockDb.adminAuditLog = { count: jest.fn() }
+  transactionErasureUpdate = jest.fn().mockResolvedValue({})
   mockDb.$transaction = jest.fn((callback: any) =>
     callback({
       session: { count: jest.fn().mockResolvedValue(5) },
@@ -98,6 +101,7 @@ beforeEach(() => {
         updateMany: jest.fn().mockResolvedValue({ count: 2 }),
       },
       adminAuditLog: { count: jest.fn().mockResolvedValue(0) },
+      erasureRequest: { update: transactionErasureUpdate },
       user: { delete: jest.fn().mockResolvedValue({}) },
     })
   )
@@ -159,6 +163,29 @@ describe('Privacy Erasure Workflow', () => {
       await expect(
         createErasureRequest('user-123', 'admin', 'test')
       ).rejects.toThrow('Erasure request already exists')
+    })
+
+    it('handles unique constraint violation (P2002) from concurrent creation gracefully', async () => {
+      mockDb.user.findUnique.mockResolvedValue({
+        id: 'user-123',
+        walletAddress: 'GA...',
+      })
+      mockDb.erasureRequest.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          id: 'racing-request',
+          status: 'PENDING',
+        })
+
+      const p2002Error: any = new Error('Unique constraint failed')
+      p2002Error.code = 'P2002'
+      mockDb.erasureRequest.create.mockRejectedValue(p2002Error)
+
+      await expect(
+        createErasureRequest('user-123', 'admin', 'test')
+      ).rejects.toThrow(
+        'Erasure request already exists for user user-123 with status PENDING'
+      )
     })
   })
 
@@ -275,7 +302,7 @@ describe('Privacy Erasure Workflow', () => {
       expect(summary.deletedRecords.sessions).toBe(5)
       expect(summary.deletedRecords.transactions).toBe(50)
       expect(summary.anonymizedRecords.costBasisLots).toBe(10)
-      expect(mockDb.erasureRequest.update).toHaveBeenCalledWith({
+      expect(transactionErasureUpdate).toHaveBeenCalledWith({
         where: { id: requestId },
         data: {
           status: ErasureRequestStatus.COMPLETED,
@@ -300,6 +327,43 @@ describe('Privacy Erasure Workflow', () => {
       ).rejects.toThrow('Must be APPROVED')
     })
 
+    it('aborts fast when atomic claim fails due to concurrent execution (CAS race)', async () => {
+      const requestId = 'request-1'
+      const userId = 'user-123'
+
+      mockDb.erasureRequest.findUnique
+        .mockResolvedValueOnce({
+          id: requestId,
+          userId,
+          status: ErasureRequestStatus.APPROVED,
+          approvedBy: 'admin-b',
+          user: { id: userId, walletAddress: 'GABC...' },
+        })
+        .mockResolvedValueOnce({
+          status: ErasureRequestStatus.PROCESSING,
+        })
+
+      // Another execution claimed it first
+      mockDb.erasureRequest.updateMany.mockResolvedValue({ count: 0 })
+
+      await expect(
+        executeErasure(requestId, 'admin-c', 'DELETE user-123')
+      ).rejects.toThrow(
+        'Cannot execute request in status PROCESSING. Must be APPROVED.'
+      )
+
+      // Losing execution MUST NOT revoke sessions or mark status as FAILED
+      expect(revokeAllUserSessions).not.toHaveBeenCalled()
+      expect(mockDb.$transaction).not.toHaveBeenCalled()
+      expect(mockDb.erasureRequest.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: ErasureRequestStatus.FAILED,
+          }),
+        })
+      )
+    })
+
     it('marks request as failed on error and alerts', async () => {
       const requestId = 'request-1'
       mockDb.erasureRequest.findUnique.mockResolvedValue({
@@ -316,8 +380,8 @@ describe('Privacy Erasure Workflow', () => {
         executeErasure(requestId, 'admin-c', 'DELETE user-123')
       ).rejects.toThrow('Database error')
 
-      expect(mockDb.erasureRequest.update).toHaveBeenCalledWith({
-        where: { id: requestId },
+      expect(mockDb.erasureRequest.updateMany).toHaveBeenCalledWith({
+        where: { id: requestId, status: ErasureRequestStatus.PROCESSING },
         data: {
           status: ErasureRequestStatus.FAILED,
           errorMessage: 'Database error',
