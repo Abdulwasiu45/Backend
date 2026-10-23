@@ -664,6 +664,19 @@ export const config = {
     userEventsMaxPerUser: parseInt(
       process.env.USER_EVENT_STREAM_MAX_PER_USER || '5000'
     ),
+    /**
+     * Admin audit log retention (#682). Preserved during user-level data erasure,
+     * but bound to a maximum lifecycle under data-minimization policies.
+     * Default: 365 days.
+     */
+    adminAuditLogsDays: parseInt(
+      process.env.RETENTION_ADMIN_AUDIT_LOGS_DAYS || '365'
+    ),
+    /**
+     * Legal hold override (#682). When true, all admin audit log retention purges
+     * are completely frozen to preserve evidence during regulatory reviews or litigation.
+     */
+    adminAuditLegalHold: process.env.ADMIN_AUDIT_LEGAL_HOLD === 'true',
     intervalMs: parseInt(process.env.RETENTION_INTERVAL_MS || '86400000'),
   },
   protocolRisk: {
