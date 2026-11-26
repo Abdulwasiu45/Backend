@@ -20,6 +20,7 @@ import { getActivePolicy } from '../treasury/policy'
 import { enqueueOutboxOp } from '../outbox/service'
 import { getNativeBalance } from '../stellar/client'
 import { alertingService } from '../services/alerting'
+import { scheduleResilientJob } from './resilientScheduler'
 
 const TREASURY_SWEEP_INTERVAL_MS = 300_000 // 5 minutes
 const HYSTERESIS_FACTOR = 1.5 // targetHigh must be >= targetLow * 1.5
@@ -27,7 +28,12 @@ const HYSTERESIS_FACTOR = 1.5 // targetHigh must be >= targetLow * 1.5
 export interface SweepPlan {
   fromTier: TreasuryTier
   toTier: TreasuryTier
+  /** Public key of the specific source account that is over the band. */
+  fromPublicKey: string
+  /** Public key of the specific destination account to sweep into. */
+  toPublicKey: string
   asset: string
+  assetIssuer?: string
   amount: string
   reason: string
 }
@@ -56,7 +62,16 @@ async function planSweeps(
 
     const accounts = await db.treasuryAccount.findMany({
       where: { tier: fromTier, isActive: true },
+      orderBy: { createdAt: 'asc' },
     })
+
+    // Resolve the destination account once per tier pair.
+    const toAccount = await db.treasuryAccount.findFirst({
+      where: { tier: toTier, isActive: true },
+      orderBy: { createdAt: 'asc' },
+    })
+
+    if (!toAccount) continue
 
     for (const account of accounts) {
       const balance = await getNativeBalance(account.publicKey).catch(() => 0)
@@ -66,6 +81,8 @@ async function planSweeps(
       plans.push({
         fromTier,
         toTier,
+        fromPublicKey: account.publicKey,
+        toPublicKey: toAccount.publicKey,
         asset: 'XLM',
         amount: over.toFixed(7),
         reason: 'hot_over_high_band',
@@ -84,9 +101,11 @@ async function planSweeps(
 
 export async function evaluateTreasuryBalances(): Promise<SweepPlan[]> {
   const plans = (await planSweeps(false)).map(
-    ({ fromTier, toTier, asset, amount, reason }) => ({
+    ({ fromTier, toTier, fromPublicKey, toPublicKey, asset, amount, reason }) => ({
       fromTier,
       toTier,
+      fromPublicKey,
+      toPublicKey,
       asset,
       amount,
       reason,
@@ -168,7 +187,7 @@ async function runSweep(plan: SweepPlan): Promise<void> {
       amount: plan.amount,
       status: 'PLANNED',
       reason: plan.reason,
-    },
+    } as any,
   })
 
   const op = await enqueueOutboxOp(db, {
@@ -180,6 +199,8 @@ async function runSweep(plan: SweepPlan): Promise<void> {
       method: 'treasury_sweep',
       fromTier: plan.fromTier,
       toTier: plan.toTier,
+      fromPublicKey: plan.fromPublicKey,
+      toPublicKey: plan.toPublicKey,
       asset: plan.asset,
       amount: Number(plan.amount),
       sweepId: sweep.id,
@@ -204,8 +225,26 @@ export async function executeEmergencySweep(
   asset: string,
   amount: string,
   triggeredBy: string,
-  reason: string
+  reason: string,
+  assetIssuer?: string
 ): Promise<void> {
+  // Resolve explicit accounts so the executor uses the caller's intended pair.
+  const [fromAccount, toAccount] = await Promise.all([
+    db.treasuryAccount.findFirst({
+      where: { tier: fromTier, isActive: true },
+      orderBy: { createdAt: 'asc' },
+    }),
+    db.treasuryAccount.findFirst({
+      where: { tier: toTier, isActive: true },
+      orderBy: { createdAt: 'asc' },
+    }),
+  ])
+  if (!fromAccount || !toAccount) {
+    throw new Error(
+      `No active treasury account found for tier ${!fromAccount ? fromTier : toTier}`
+    )
+  }
+
   const sweep = await db.treasurySweep.create({
     data: {
       fromTier,
@@ -214,7 +253,7 @@ export async function executeEmergencySweep(
       amount,
       status: 'PLANNED',
       reason: `emergency:${reason}`,
-    },
+    } as any,
   })
 
   const op = await enqueueOutboxOp(db, {
@@ -227,7 +266,10 @@ export async function executeEmergencySweep(
       method: 'treasury_sweep',
       fromTier,
       toTier,
+      fromPublicKey: fromAccount.publicKey,
+      toPublicKey: toAccount.publicKey,
       asset,
+      assetIssuer,
       amount: Number(amount),
       sweepId: sweep.id,
     },
@@ -268,4 +310,48 @@ export function validateHysteresis(
 export const TREASURY_SWEEP_CONFIG = {
   INTERVAL_MS: TREASURY_SWEEP_INTERVAL_MS,
   HYSTERESIS_FACTOR,
+}
+
+/**
+ * Automatic treasury sweep scheduler (#945). Skips a tier pair while it
+ * still has a SUBMITTED sweep in flight, so overlapping sweeps never queue up.
+ */
+export async function runTreasurySweepJob(): Promise<void> {
+  try {
+    const plans = await evaluateTreasuryBalances()
+    if (plans.length === 0) return
+
+    // Skip tier pairs with any in-flight sweep (SUBMITTED or PLANNED).
+    for (const plan of plans) {
+      const inFlight = await db.treasurySweep.findFirst({
+        where: {
+          fromTier: plan.fromTier,
+          toTier: plan.toTier,
+          status: { in: ['PLANNED', 'SUBMITTED'] },
+        },
+        select: { id: true },
+      })
+      if (inFlight) {
+        logger.info('[TreasurySweep] Skipping tier pair with in-flight sweep', {
+          fromTier: plan.fromTier,
+          toTier: plan.toTier,
+        })
+        continue
+      }
+
+      await executeSweep(plan)
+    }
+  } catch (err) {
+    logger.error('[TreasurySweep] Scheduled sweep failed', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+export function scheduleTreasurySweeps(): NodeJS.Timeout {
+  return scheduleResilientJob({
+    jobName: 'treasury-sweeps',
+    task: runTreasurySweepJob,
+    intervalMs: TREASURY_SWEEP_INTERVAL_MS,
+  })
 }
